@@ -1,0 +1,13 @@
+steps:
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  args:
+  - 'functions'
+  - 'deploy'
+  - 'hello-gonews'
+  - '--gen2'
+  - '--runtime=python312'
+  - '--region=europe-west1'
+  - '--source=.'
+  - '--entry-point=hello_world'
+  - '--trigger-http'
+  - '--allow-unauthenticated'
