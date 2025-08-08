@@ -1,7 +1,8 @@
 import datetime
-from utils.auth import get_gspread_client # Yeni auth fonksiyonumuzu import ediyoruz
+import os # EKLENDİ
+from utils.auth import get_gspread_client
 
-SHEET_ID = '1QMjWTYQHVFM8Ucygks_t8NHmLaZYMFuooreE9TjyIqc'
+SHEET_ID = os.environ.get('GOOGLE_SHEET_ID') # DEĞİŞTİ
 LOG_TAB = 'Logs'
 
 def log_to_sheet(robot_name, status, notes):

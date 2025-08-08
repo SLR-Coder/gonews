@@ -2,9 +2,10 @@ import feedparser
 import uuid
 import datetime
 import re
-from utils.auth import get_gspread_client # Yeni auth fonksiyonumuzu import ediyoruz
+import os # EKLENDİ
+from utils.auth import get_gspread_client
 
-SHEET_ID = '1QMjWTYQHVFM8Ucygks_t8NHmLaZYMFuooreE9TjyIqc'
+SHEET_ID = os.environ.get('GOOGLE_SHEET_ID') # DEĞİŞTİ
 NEWS_TAB = 'News'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 CREDS_FILE = 'service_account.json'
