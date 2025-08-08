@@ -1,0 +1,14 @@
+# Google Cloud Service Account Key
+service_account.json
+
+# macOS system files
+.DS_Store
+
+# Python cache and virtual environment files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.env
