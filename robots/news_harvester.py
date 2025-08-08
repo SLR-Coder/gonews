@@ -1,10 +1,10 @@
 import feedparser
 import uuid
 import datetime
-import gspread
-from google.oauth2.service_account import Credentials
+import re
+from utils.auth import get_gspread_client # Yeni auth fonksiyonumuzu import ediyoruz
 
-SHEET_ID = '1OZJc3ZapwvzWRfiflA1ElFjAr_0fbYiBw1Lerf4Bbzc'
+SHEET_ID = '1QMjWTYQHVFM8Ucygks_t8NHmLaZYMFuooreE9TjyIqc'
 NEWS_TAB = 'News'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 CREDS_FILE = 'service_account.json'
@@ -80,14 +80,14 @@ def fetch_rss_news(feed_url):
         return f"Hata: {e}"
 
 def get_existing_links():
-    credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-    gc = gspread.authorize(credentials)
+    gc = get_gspread_client() # Kimlik doğrulamayı artık bu fonksiyon hallediyor
     worksheet = gc.open_by_key(SHEET_ID).worksheet(NEWS_TAB)
     try:
-        existing_links = worksheet.col_values(7)[1:]  # G sütunu (başlık hariç)
+        existing_links = worksheet.col_values(7)[1:]
     except Exception:
         existing_links = []
     return set(existing_links)
+
 
 def run():
     errors = []
