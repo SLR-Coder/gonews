@@ -9,8 +9,10 @@ steps:
   - '--runtime=python312'
   - '--region=europe-west1'
   - '--source=.'
-  - '--entry-point=hello_world'
+  - '--entry-point=run_gonews' # Test ettiğimiz ana fonksiyonumuz
   - '--trigger-http'
   - '--allow-unauthenticated'
+  - '--memory=1GiB'           # YENİ SATIR: Belleği 1 GB'a çıkardık
+  - '--timeout=300s'          # YENİ SATIR: Zaman aşımını 5 dakikaya çıkardık
 options:
   logging: CLOUD_LOGGING_ONLY
