@@ -1,14 +1,21 @@
-# Google Cloud Service Account Key
-service_account.json
-
-# macOS system files
-.DS_Store
-
-# Python cache and virtual environment files
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Sanal ortam klasörleri
 venv/
 env/
+.venv/
+
+# Hassas bilgiler
 .env
+service_account.json
+
+# Oluşturulan görseller
+styled_images/
+
+# IDE/Editör dosyaları
+.idea/
+.vscode/

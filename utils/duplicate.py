@@ -2,7 +2,10 @@ import openai
 import numpy as np
 import os
 
-openai.api_key = os.environ.get("OPENAI_API_KEY", "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") # Veya doğrudan keyini buraya yaz
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY ortam değişkeni bulunamadı!")
+openai.api_key = OPENAI_API_KEY
 
 def get_embedding(text, model="text-embedding-ada-002"):
     response = openai.embeddings.create(input=[text], model=model)

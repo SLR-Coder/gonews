@@ -1,275 +1,183 @@
-import datetime
-import gspread
-from google.oauth2.service_account import Credentials
-from utils.gemini import generate_title, generate_summary, generate_long_text
-from utils.duplicate import is_duplicate
+# robots/content_crafter.py
+# -*- coding: utf-8 -*-
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
 import time
+import datetime
+import traceback
+from typing import List, Tuple, Dict
 
-SHEET_ID = '1OZJc3ZapwvzWRfiflA1ElFjAr_0fbYiBw1Lerf4Bbzc'
-NEWS_TAB = 'News'
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-CREDS_FILE = 'service_account.json'
+from utils.auth import get_gspread_client
+from utils.schema import resolve_columns
+from utils.gemini import generate_content, get_embedding
 
-COL_ORG_TITLE = 6    # F
-COL_ORG_LINK = 7     # G
-COL_CATEGORY = 3     # C
-COL_NEWTITLE = 8     # H
-COL_SUMMARY = 9      # I
-COL_LONGTEXT = 10    # J
-COL_IMAGE = 11       # K
-COL_STATUS = 19      # S
+# ====== Ayarlar (.env) ======
+NEWS_TAB           = os.environ.get("NEWS_TAB", "News")
 
-# ---- Kategoriye Özel GÜNCEL Prompt Ayarları ----
-CATEGORY_PROMPTS = {
-    "teknoloji": {
-        "title": """
-Aşağıdaki teknoloji haberinin başlığını ve özetini dikkatlice oku. Eğer başlık İngilizce ise önce Türkçeye çevir, sonra ilgi çekici ve kısa bir başlık üret. Sadece Türkçe başlık yaz, başka bilgi ekleme.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Haberi tamamen oku, eğer içerik İngilizce ise Türkçeye çevir. En önemli yeniliği, gelişmeyi 2-3 cümleyle sade ve özgün şekilde özetle. Sadece Türkçe özet yaz, başka cümle ekleme.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Haberi baştan sona oku, İngilizce ise Türkçeye çevir. Teknik detaylarını ve gelişmelerini 4–6 paragraf özgün Türkçe metinle baştan yaz. Yalnızca haber metnini üret, giriş/gelişme/sonuç yapabilirsin. Açıklama ekleme.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "spor": {
-        "title": """
-Aşağıdaki spor haberinin başlığını ve özetini dikkatlice oku. İngilizce ise önce Türkçeye çevir, ardından heyecanlı ve kısa Türkçe bir başlık üret. Sadece başlık yaz.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Spor haberini oku, İngilizceyse çevir. Maç sonucu, yıldız oyuncu veya önemli anı 2-3 cümlede Türkçe özetle. Sadece özet yaz.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Spor haberini baştan sona incele, gerekiyorsa çevir. Önemli anları, sonuçları ve etkisini 4–6 paragraf Türkçe, özgün şekilde yaz. Sadece haberin detaylarını anlat.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "ekonomi": {
-        "title": """
-Ekonomi haberinin başlığını oku, İngilizce ise çevir. Sade ve dikkat çekici Türkçe başlık yaz. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Ekonomi haberini incele, İngilizceyse çevir. En önemli gelişmeyi ve etkisini 2-3 cümleyle Türkçe özetle. Sadece özet yaz.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Ekonomi haberinin arka planını, sonuçlarını ve piyasa etkilerini 4-6 paragraf halinde özgün Türkçe metinle yaz. Yalnızca haber metni üret.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "kultur": {
-        "title": """
-Kültür/sanat haberinin başlığını oku, İngilizceyse Türkçeye çevir ve merak uyandıran kısa bir başlık üret. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Kültür/sanat haberini dikkatlice incele, gerekiyorsa Türkçeye çevir. Eser, sanatçı veya etkinliği 2-3 cümlede özgün şekilde özetle. Sadece özet.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Haberi oku, İngilizceyse çevir. Sanatçının/etkinliğin öyküsünü ve kültürel etkisini 4-6 paragraf özgün Türkçe metinle anlat. Sadece haber metni.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "dunya_gundemi": {
-        "title": """
-Dünya gündemi haberinin başlığını oku, İngilizce ise çevir ve küresel önemi vurgulayan kısa bir Türkçe başlık üret. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Dünya haberini oku, İngilizceyse çevir. En kritik gelişmeyi ve etkisini 2-3 cümleyle Türkçe özetle. Sadece özet.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Dünya gündemi haberini detaylıca incele, İngilizceyse çevir. Nedeni, sonucu ve etkilerini 4-6 paragraf Türkçe metinle yaz. Sadece haber metni üret.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "turkiye_gundemi": {
-        "title": """
-Türkiye gündemi haberinin başlığını incele, İngilizceyse çevir. Toplumsal veya güncel önemi vurgulayan kısa bir Türkçe başlık yaz. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Türkiye haberini oku, İngilizceyse çevir. Gelişmenin ülke genelindeki etkisini 2-3 cümlede Türkçe özetle. Sadece özet.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Türkiye gündemi haberini baştan sona oku, gerekiyorsa çevir. Siyasi/ekonomik/toplumsal yönleriyle 4-6 paragraf Türkçe özgün haber metni yaz. Sadece haber metni.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "sondakika": {
-        "title": """
-Son dakika haberinin başlığını dikkatlice oku, İngilizce ise çevir. Aciliyet duygusu taşıyan kısa ve dikkat çekici bir Türkçe başlık yaz. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Son dakika gelişmesini incele, İngilizceyse çevir. En önemli bilgiyi 2-3 cümleyle özetle. Sadece özet.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Son dakika gelişmesinin tüm detaylarını, önemini ve etkilerini 4-6 paragraf hızlı ve net Türkçe metinle yaz. Sadece haber metni.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "fotogaleri": {
-        "title": """
-Foto galeri başlığını oku, İngilizceyse çevir. Galerinin konusuna ve görsellere uygun ilgi çekici Türkçe başlık üret. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Foto galeriyi incele, gerekiyorsa çevir. Temasını ve öne çıkan kareleri 2-3 cümleyle Türkçe özetle. Sadece özet.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Foto galerinin hikayesini, görsellerin anlamını ve olayın detaylarını 4-6 paragraf Türkçe haber metniyle yaz. Sadece haber metni üret.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    },
-    "default": {
-        "title": """
-Aşağıdaki haberin başlığını ve özetini dikkatlice oku. İngilizceyse çevir, ardından kategoriye uygun, kısa ve dikkat çekici Türkçe başlık yaz. Sadece başlık.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "summary": """
-Haberi incele, İngilizceyse çevir. En önemli gelişmeyi 2-3 cümleyle açık ve anlaşılır biçimde özetle. Sadece özet yaz.
-Başlık: {org_title}
-Link: {org_link}
-""",
-        "longtext": """
-Haberi baştan sona oku, gerekiyorsa çevir. Önemli gelişmeleri ve etkilerini Türkçe 4-6 paragraf halinde kapsamlı ve özgün şekilde yaz. Sadece haber metni üret.
-Başlık: {org_title}
-Link: {org_link}
-"""
-    }
-}
+# Duplicate eşiği (0.0–1.0 arası anlamlı). >=1.5 ise KAPALI sayılır (performans için).
+DUP_THRESHOLD      = float(os.environ.get("DUP_THRESHOLD", "2.0"))
 
-def get_unprocessed_news():
-    credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-    gc = gspread.authorize(credentials)
-    worksheet = gc.open_by_key(SHEET_ID).worksheet(NEWS_TAB)
-    all_rows = worksheet.get_all_values()
-    news_rows = []
-    for i, row in enumerate(all_rows[1:], start=2):
-        status = row[COL_STATUS-1].strip().lower()
-        newtitle = row[COL_NEWTITLE-1].strip()
-        summary = row[COL_SUMMARY-1].strip()
-        longtext = row[COL_LONGTEXT-1].strip()
-        image = row[COL_IMAGE-1].strip()
-        if (
-            status == "robot 1 başarılı" and
-            not newtitle and not summary and not longtext and
-            image
-        ):
-            news_rows.append({
-                "row_index": i,
-                "org_title": row[COL_ORG_TITLE-1],
-                "org_link": row[COL_ORG_LINK-1],
-                "category": row[COL_CATEGORY-1],
-                "image": image
-            })
-    return news_rows, worksheet, all_rows
+# Kaç satırı bir seferde yazalım / aralarda bekleme
+CRAFTER_BATCH      = int(os.environ.get("CRAFTER_BATCH", "30"))
+CRAFTER_SLEEP_MS   = int(os.environ.get("CRAFTER_SLEEP_MS", "800"))
 
-def get_existing_titles(all_rows):
-    return [row[COL_NEWTITLE-1] for row in all_rows if row[COL_NEWTITLE-1].strip()]
+# Yumuşak limitler
+TITLE_MIN_CHARS    = int(os.environ.get("TITLE_MIN_CHARS", "55"))
+TITLE_MAX_CHARS    = int(os.environ.get("TITLE_MAX_CHARS", "85"))
+SUMMARY_MAX_WORDS  = int(os.environ.get("SUMMARY_MAX_WORDS", "70"))
 
-def build_prompts(category, org_title, org_link):
-    cat = category.lower()
-    prompts = CATEGORY_PROMPTS.get(cat, CATEGORY_PROMPTS["default"])
-    # Bütün promptlarda hem org_title hem org_link parametresini kullanalım:
-    return (
-        prompts["title"].format(org_title=org_title, org_link=org_link),
-        prompts["summary"].format(org_title=org_title, org_link=org_link),
-        prompts["longtext"].format(org_title=org_title, org_link=org_link)
-    )
+# İsteğe bağlı üst sınır (0 = sınırsız)
+CRAFTER_MAX_ROWS   = int(os.environ.get("CRAFTER_MAX_ROWS", "0"))
 
-def process_news_row(news_row, worksheet, existing_titles):
-    org_title = news_row["org_title"]
-    org_link = news_row["org_link"]
-    category = news_row["category"]
+# ====== Yardımcılar ======
+def _trim_words(text: str, max_words: int) -> str:
+    w = (text or "").split()
+    return " ".join(w[:max_words]) + ("…" if len(w) > max_words else "")
 
-    title_prompt, summary_prompt, longtext_prompt = build_prompts(category, org_title, org_link)
-    new_title = generate_title(title_prompt).strip()
+def _clip_title(title: str) -> str:
+    t = (title or "").strip()
+    if len(t) > TITLE_MAX_CHARS:
+        return t[:TITLE_MAX_CHARS - 1].rstrip() + "…"
+    return t
 
-    # --- AI Duplicate Detection ---
-    if is_duplicate(new_title, existing_titles, threshold=0.85):
-        worksheet.update(f"S{news_row['row_index']}", [["Robot 1 Başarılı / Robot 2 Önceden İşlenmiş"]])
-        print(f"Duplicate: {new_title}")
-        return
+def _cos_sim(a: List[float], b: List[float]) -> float:
+    # küçük ve hızlı: normalize etmeden kosinüs
+    if not a or not b: return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na  = (sum(x*x for x in a)) ** 0.5
+    nb  = (sum(y*y for y in b)) ** 0.5
+    if na == 0 or nb == 0: return 0.0
+    return dot / (na * nb)
 
-    try:
-        summary = generate_summary(summary_prompt).strip()
-        if not summary or "oluşturulamamıştır" in summary or "Lütfen linkin doğruluğunu" in summary:
-            summary = "Özet üretilemedi."
-    except Exception as e:
-        summary = f"Özet üretilemedi. Hata: {e}"
-    
-    try:
-        long_text = generate_long_text(longtext_prompt).strip()
-        if not long_text or "oluşturulamamıştır" in long_text:
-            long_text = "Haber metni üretilemedi."
-    except Exception as e:
-        long_text = f"Haber metni üretilemedi. Hata: {e}"
+def _duplicate_in_batch(cat: str, title: str, cache: Dict[str, List[Tuple[str, List[float]]]]) -> bool:
+    """Aynı kategori içinde, aynı batch’te üretilenler arasında benzerlik kontrolü."""
+    if DUP_THRESHOLD >= 1.5:
+        return False
+    cur_emb = get_embedding(title) or []
+    if not cur_emb:
+        return False
+    for prev_title, prev_emb in cache.get(cat, []):
+        if prev_emb:
+            if _cos_sim(cur_emb, prev_emb) >= DUP_THRESHOLD:
+                return True
+    # cache’e ekle
+    cache.setdefault(cat, []).append((title, cur_emb))
+    return False
 
-    worksheet.update(
-        f"H{news_row['row_index']}:J{news_row['row_index']}",
-        [[new_title, summary, long_text]]
-    )
-    time.sleep(1)
-    worksheet.update(
-        f"S{news_row['row_index']}",
-        [[f"Robot 1 Başarılı / Robot 2 Başarılı"]]
-    )
-    time.sleep(1)
-
+# ====== Ana Çalışma ======
 def run():
-    news_rows, worksheet, all_rows = get_unprocessed_news()
-    existing_titles = get_existing_titles(all_rows)
-    print(f"{len(news_rows)} adet haber işleniyor...")
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        raise RuntimeError("GOOGLE_SHEET_ID boş.")
 
-    for news_row in news_rows:
-        try:
-            process_news_row(news_row, worksheet, existing_titles)
-        except Exception as e:
-            worksheet.update(
-                f"S{news_row['row_index']}",
-                [[f"Robot 1 Başarılı / Robot 2 Hata: {str(e)}"]]
-            )
-            print(f"Hata: Satır {news_row['row_index']}: {str(e)}")
+    gc   = get_gspread_client()
+    ws   = gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
+    cols = resolve_columns(ws)
 
-    print("ContentCrafter tamamlandı.")
+    values = ws.get_all_values()
+    data   = values[1:]  # header hariç
+
+    # İşlenecekleri topla: sadece AC = Robot 1 Başarılı ve H/I/J boş
+    todo: List[Tuple[int, str, str, str, str, str]] = []
+    for i, row in enumerate(data, start=2):
+        ac   = (row[cols.AC - 1].strip() if len(row) >= cols.AC else "")
+        h    = (row[cols.H  - 1].strip() if len(row) >= cols.H  else "")
+        i_tx = (row[cols.I  - 1].strip() if len(row) >= cols.I  else "")
+        j    = (row[cols.J  - 1].strip() if len(row) >= cols.J  else "")
+        title= (row[cols.F  - 1].strip() if len(row) >= cols.F  else "")
+        link = (row[cols.G  - 1].strip() if len(row) >= cols.G  else "")
+        cat  = (row[cols.C  - 1].strip() if len(row) >= cols.C  else "")
+        src  = (row[cols.D  - 1].strip() if len(row) >= cols.D  else "")
+        lang = (row[cols.E  - 1].strip() if len(row) >= cols.E  else "")
+
+        if "robot 1 başarılı" not in ac.lower():
+            continue
+        if not title or not link or not cat:
+            continue
+        if h or i_tx or j:
+            continue
+
+        todo.append((i, title, link, cat, src, lang))
+
+    if CRAFTER_MAX_ROWS and len(todo) > CRAFTER_MAX_ROWS:
+        todo = todo[:CRAFTER_MAX_ROWS]
+
+    print(f"İşlenecek satır: {len(todo)} (yalnızca AC='Robot 1 Başarılı')")
+
+    processed = 0
+    # batch içi duplicate kontrolü için embedding cache
+    batch_dup_cache: Dict[str, List[Tuple[str, List[float]]]] = {}
+
+    for start in range(0, len(todo), CRAFTER_BATCH):
+        batch = todo[start:start + CRAFTER_BATCH]
+
+        for (row_idx, title, link, cat, src, lang) in batch:
+            try:
+                # — Opsiyonel duplicate (sadece aynı batch içinde, hızlı)
+                if _duplicate_in_batch(cat, title, batch_dup_cache):
+                    ws.update_cell(row_idx, cols.AC, "Tekrarlanan Haber - Atlandı")
+                    ws.update_cell(row_idx, cols.AD, f"Batch dup ≥ {DUP_THRESHOLD}")
+                    continue
+
+                # — İçerik üretimi
+                out = generate_content(
+                    original_title=title,
+                    original_text="",
+                    original_lang=lang or "en",
+                    target_lang="tr",
+                    source_name=src
+                )
+
+                new_h = (out.get("title") or "").strip()
+                new_i = (out.get("summary") or "").strip()
+                new_j = (out.get("long") or "").strip()
+
+                # --- Yumuşak düzeltmeler ---
+                # Başlık: boşsa orijinal başlık; sonra max’a göre kısalt
+                if not new_h:
+                    new_h = title.strip()
+                new_h = _clip_title(new_h)
+
+                # Özet: boşsa uzun metinden ilk cümle; o da yoksa başlık
+                if not new_i:
+                    first = ""
+                    txt = (new_j or "").strip()
+                    if txt:
+                        for sep in [".", "!", "?"]:
+                            p = txt.find(sep)
+                            if p > 20:
+                                first = txt[:p+1].strip()
+                                break
+                    if not first:
+                        first = txt or new_h
+                    new_i = first
+                # Özet kelime limiti
+                new_i = _trim_words(new_i, SUMMARY_MAX_WORDS)
+
+                # Ufak kalite: bağıran başlıkları sakinleştir
+                if new_h.isupper():
+                    new_h = new_h.capitalize()
+
+                # — Sheet’e yaz
+                ws.update_cell(row_idx, cols.H,  new_h)
+                ws.update_cell(row_idx, cols.I,  new_i)
+                ws.update_cell(row_idx, cols.J,  new_j)
+                ws.update_cell(row_idx, cols.AC, "Robot 1 Başarılı / Robot 2 Başarılı")
+                ws.update_cell(row_idx, cols.AD, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                processed += 1
+
+            except Exception as e:
+                ws.update_cell(row_idx, cols.AC, "Robot 1 Başarılı / Robot 2 Hata")
+                ws.update_cell(row_idx, cols.AD, f"{type(e).__name__}: {e}")
+                traceback.print_exc()
+
+        # quota-dostu bekleme
+        time.sleep(CRAFTER_SLEEP_MS / 1000.0)
+
+    print(f"✓ Robot 2 bitti — işlendi: {processed}")
 
 if __name__ == "__main__":
     run()
