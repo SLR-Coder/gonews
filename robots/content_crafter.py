@@ -5,179 +5,382 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 import time
 import datetime
-import traceback
-from typing import List, Tuple, Dict
+import unicodedata
+from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+import gspread
+import requests
+from bs4 import BeautifulSoup
 
 from utils.auth import get_gspread_client
 from utils.schema import resolve_columns
-from utils.gemini import generate_content, get_embedding
+from utils.gemini import generate_text  # retry + fallback .env'e göre
 
-# ====== Ayarlar (.env) ======
-NEWS_TAB           = os.environ.get("NEWS_TAB", "News")
+# ================== ENV / AYARLAR ==================
+NEWS_TAB               = os.environ.get("NEWS_TAB", "News")
 
-# Duplicate eşiği (0.0–1.0 arası anlamlı). >=1.5 ise KAPALI sayılır (performans için).
-DUP_THRESHOLD      = float(os.environ.get("DUP_THRESHOLD", "2.0"))
+CRAFTER_MAX_ROWS       = int(os.environ.get("CRAFTER_MAX_ROWS", "100"))
+CRAFTER_CONCURRENCY    = int(os.environ.get("CRAFTER_CONCURRENCY", "8"))   # paralel iş parçası
+CRAFTER_BATCH          = int(os.environ.get("CRAFTER_BATCH", "40"))        # tek batch'te kaç hücre yazalım
+CRAFTER_SLEEP_MS       = int(os.environ.get("CRAFTER_SLEEP_MS", "800"))    # batch arası bekleme (ms)
 
-# Kaç satırı bir seferde yazalım / aralarda bekleme
-CRAFTER_BATCH      = int(os.environ.get("CRAFTER_BATCH", "30"))
-CRAFTER_SLEEP_MS   = int(os.environ.get("CRAFTER_SLEEP_MS", "800"))
+INPUT_MAX_CHARS        = int(os.environ.get("INPUT_MAX_CHARS", "12000"))
+SUMMARY_MAX_WORDS      = int(os.environ.get("SUMMARY_MAX_WORDS", "70"))
+TITLE_MIN_CHARS        = int(os.environ.get("TITLE_MIN_CHARS", "55"))
+TITLE_MAX_CHARS        = int(os.environ.get("TITLE_MAX_CHARS", "85"))
+# başlık hedef aralığı: fazla uzamasın diye min ile min+20
+TITLE_TARGET_MIN       = TITLE_MIN_CHARS
+TITLE_TARGET_MAX       = min(TITLE_MAX_CHARS, TITLE_MIN_CHARS + 20)
 
-# Yumuşak limitler
-TITLE_MIN_CHARS    = int(os.environ.get("TITLE_MIN_CHARS", "55"))
-TITLE_MAX_CHARS    = int(os.environ.get("TITLE_MAX_CHARS", "85"))
-SUMMARY_MAX_WORDS  = int(os.environ.get("SUMMARY_MAX_WORDS", "70"))
+ARTICLE_MIN_WORDS      = int(os.environ.get("ARTICLE_MIN_WORDS", "450"))
+ARTICLE_MAX_WORDS      = int(os.environ.get("ARTICLE_MAX_WORDS", "700"))
 
-# İsteğe bağlı üst sınır (0 = sınırsız)
-CRAFTER_MAX_ROWS   = int(os.environ.get("CRAFTER_MAX_ROWS", "0"))
+REQUEST_TIMEOUT        = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+USER_AGENT             = os.environ.get("USER_AGENT", "GoNewsBot/1.0 (+https://example.com)")
+HEADERS                = {"User-Agent": USER_AGENT}
 
-# ====== Yardımcılar ======
-def _trim_words(text: str, max_words: int) -> str:
-    w = (text or "").split()
-    return " ".join(w[:max_words]) + ("…" if len(w) > max_words else "")
+# ================== STATÜ YARDIMCILARI ==================
+def status_text(robot_no: int, ok: bool) -> str:
+    return f"Robot {robot_no} {'✅' if ok else '❌'}"
 
-def _clip_title(title: str) -> str:
-    t = (title or "").strip()
-    if len(t) > TITLE_MAX_CHARS:
-        return t[:TITLE_MAX_CHARS - 1].rstrip() + "…"
-    return t
+def _compose_status_block(current: Optional[str], robot_no: int, ok: bool) -> str:
+    """
+    AC hücresi için:
+      - Mevcut bloktaki "Robot n ✅/❌" satırını siler
+      - "Robot n ✅|❌" satırını en alta ekler
+      - Açıklama parçalarını (— …) temizler
+    """
+    lines: List[str] = []
+    for ln in (current or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        m = re.match(r"^(Robot\s+\d+\s+[✅❌])", s)
+        if m:
+            s = m.group(1)
+        if re.match(rf"^Robot\s+{robot_no}\s+[✅❌]$", s):
+            continue
+        lines.append(s)
+    lines.append(f"Robot {robot_no} {'✅' if ok else '❌'}")
+    return "\n".join(lines)
 
-def _cos_sim(a: List[float], b: List[float]) -> float:
-    # küçük ve hızlı: normalize etmeden kosinüs
-    if not a or not b: return 0.0
-    dot = sum(x*y for x, y in zip(a, b))
-    na  = (sum(x*x for x in a)) ** 0.5
-    nb  = (sum(y*y for y in b)) ** 0.5
-    if na == 0 or nb == 0: return 0.0
-    return dot / (na * nb)
+# ================== UZUN METİN SÜTUNU BULUCU ==================
+CANDIDATE_LONGTEXT_HEADERS = [
+    "content","article","text","body","metin","haber metni","içerik","icerik",
+    "fulltext","longtext","article text","content body","story","story body"
+]
 
-def _duplicate_in_batch(cat: str, title: str, cache: Dict[str, List[Tuple[str, List[float]]]]) -> bool:
-    """Aynı kategori içinde, aynı batch’te üretilenler arasında benzerlik kontrolü."""
-    if DUP_THRESHOLD >= 1.5:
-        return False
-    cur_emb = get_embedding(title) or []
-    if not cur_emb:
-        return False
-    for prev_title, prev_emb in cache.get(cat, []):
-        if prev_emb:
-            if _cos_sim(cur_emb, prev_emb) >= DUP_THRESHOLD:
-                return True
-    # cache’e ekle
-    cache.setdefault(cat, []).append((title, cur_emb))
-    return False
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("utf-8","ignore")
+    s = s.lower()
+    return re.sub(r"[^a-z0-9]+","", s)
 
-# ====== Ana Çalışma ======
+def find_longtext_col(ws: gspread.Worksheet, cols) -> Optional[int]:
+    # 1) schema öncelik: J varsa onu kullan
+    j = getattr(cols, "J", None)
+    if isinstance(j, int) and j > 0:
+        return j
+    # 2) başlıklarda esnek arama
+    headers = ws.row_values(1)
+    normed = [_norm(h) for h in headers]
+    keys = [_norm(k) for k in CANDIDATE_LONGTEXT_HEADERS]
+    for idx, h in enumerate(normed, start=1):  # 1-based
+        if not h: continue
+        for k in keys:
+            if k in h:
+                return idx
+    return None
+
+# ================== SAYFA İNDİRME & GÖVDE ÇIKARMA ==================
+SESS = requests.Session()
+SESS.headers.update(HEADERS)
+
+def fetch_html(url: str) -> Optional[bytes]:
+    try:
+        r = SESS.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200 and r.content:
+            return r.content
+    except Exception:
+        pass
+    return None
+
+def extract_article_text(html: bytes) -> str:
+    """
+    Güçlü çıkarıcı:
+      - <article> ve 'article|content|post|story|entry|main|read|detail|text|body' içeren div/section/main adayları
+      - aday içinden <h1..h4>, <p>, <li> metinleri birleştirir
+      - aday yoksa tüm dokümanda aynı birleşimi dener
+      - minimum uzunluk garantisi için en uzun bloğu seçer ve normalize eder
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # gürültü temizliği
+    for t in soup(["script","style","noscript","header","footer","form","nav","aside","iframe"]):
+        t.decompose()
+
+    def _collect_text(node):
+        parts: List[str] = []
+        for h in node.find_all(["h1","h2","h3","h4"]):
+            txt = h.get_text(" ", strip=True)
+            if txt: parts.append(txt)
+        for p in node.find_all("p"):
+            txt = p.get_text(" ", strip=True)
+            if txt: parts.append(txt)
+        for li in node.find_all("li"):
+            txt = li.get_text(" ", strip=True)
+            if txt: parts.append(txt)
+        return "\n".join(parts)
+
+    # 1) <article> öncelik
+    candidates: List[Tuple[int,str]] = []
+    for art in soup.find_all("article"):
+        txt = _collect_text(art)
+        if len(txt.split()) > 80:
+            candidates.append((len(txt.split()), txt))
+
+    # 2) class/id eşleşmeli div/section/main
+    if not candidates:
+        patt = re.compile(r"(article|content|post|story|entry|main|read|detail|text|body)", re.I)
+        for tag in soup.find_all(["div","section","main"]):
+            blob = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "")
+            if patt.search(blob):
+                txt = _collect_text(tag)
+                if len(txt.split()) > 80:
+                    candidates.append((len(txt.split()), txt))
+
+    # 3) fallback: tüm doküman
+    if not candidates:
+        whole = _collect_text(soup)
+        if whole:
+            candidates.append((len(whole.split()), whole))
+
+    if not candidates:
+        return ""
+
+    # en uzun bloğu seç
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    text = candidates[0][1]
+
+    # normalize
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    text = "\n\n".join(lines)
+    return text
+
+# ================== PROMPTLAR ==================
+def build_title_prompt(source_title: str, category: str) -> str:
+    return (
+        "Aşağıdaki haber başlığını Türkçe'de yeniden yaz.\n"
+        f"- Dikkat çekici ama abartısız olsun.\n"
+        f"- Hedef uzunluk: {TITLE_TARGET_MIN}-{TITLE_TARGET_MAX} karakter.\n"
+        f"- Asla {TITLE_MAX_CHARS} karakteri geçme.\n"
+        f"- Kategori: {category}\n\n"
+        f"Orijinal başlık:\n{source_title}\n\n"
+        "ÇIKTI YALNIZCA YENİ BAŞLIK OLSUN."
+    )
+
+def build_summary_prompt(source_title: str, body_text: str, link: str) -> str:
+    body_short = " ".join(body_text.split())[:INPUT_MAX_CHARS]
+    return (
+        "Aşağıdaki haber gövdesine dayanarak Türkçe, tarafsız ve bilgi verici BİR paragraf özet yaz.\n"
+        f"- En fazla {SUMMARY_MAX_WORDS} kelime.\n"
+        "- Sadece doğrulanabilir bilgi; duygu/yorum yok.\n"
+        "- Gereksiz sıfat/slogan olmasın.\n"
+        f"- Kaynak: {link}\n\n"
+        f"Başlık: {source_title}\n\n"
+        f"Gövde:\n{body_short}\n\n"
+        "ÇIKTI YALNIZCA ÖZET PARAGRAFI OLSUN."
+    )
+
+def build_article_prompt(source_title: str, body_text: str, link: str, category: str) -> str:
+    body_short = " ".join(body_text.split())[:INPUT_MAX_CHARS]
+    return (
+        "Aşağıdaki haber gövdesine dayanarak Türkçe, tarafsız ve TAM METİN yaz.\n"
+        f"- EN AZ {ARTICLE_MIN_WORDS} kelime olsun; tercihen {ARTICLE_MAX_WORDS} kelime civarı (3–7 paragraf).\n"
+        "- Net, bilgilendirici, abartısız bir dil kullan.\n"
+        "- Doğrulanabilir bilgiye odaklan; spekülasyon/yorum yok.\n"
+        "- Gereksiz tekrar yapma; verilerle, tarihlerle bağlam ver.\n"
+        f"- Kategori: {category}\n"
+        "- Son satıra kaynak bağlantısını parantez içinde ekle: (Kaynak: <link>)\n\n"
+        f"Başlık: {source_title}\n\n"
+        f"Gövde:\n{body_short}\n\n"
+        "ÇIKTI YALNIZCA DÜZ METİN OLSUN (markdown/HTML kullanma)."
+    )
+
+# ================== ANA AKIŞ ==================
 def run():
     sheet_id = os.environ.get("GOOGLE_SHEET_ID")
     if not sheet_id:
         raise RuntimeError("GOOGLE_SHEET_ID boş.")
 
-    gc   = get_gspread_client()
-    ws   = gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
+    gc = get_gspread_client()
+    ws = gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
     cols = resolve_columns(ws)
+    longtext_col = find_longtext_col(ws, cols)  # J varsa öncelik
 
     values = ws.get_all_values()
-    data   = values[1:]  # header hariç
+    if not values:
+        print("Sheet boş.")
+        return
 
-    # İşlenecekleri topla: sadece AC = Robot 1 Başarılı ve H/I/J boş
-    todo: List[Tuple[int, str, str, str, str, str]] = []
-    for i, row in enumerate(data, start=2):
-        ac   = (row[cols.AC - 1].strip() if len(row) >= cols.AC else "")
-        h    = (row[cols.H  - 1].strip() if len(row) >= cols.H  else "")
-        i_tx = (row[cols.I  - 1].strip() if len(row) >= cols.I  else "")
-        j    = (row[cols.J  - 1].strip() if len(row) >= cols.J  else "")
-        title= (row[cols.F  - 1].strip() if len(row) >= cols.F  else "")
-        link = (row[cols.G  - 1].strip() if len(row) >= cols.G  else "")
-        cat  = (row[cols.C  - 1].strip() if len(row) >= cols.C  else "")
-        src  = (row[cols.D  - 1].strip() if len(row) >= cols.D  else "")
-        lang = (row[cols.E  - 1].strip() if len(row) >= cols.E  else "")
+    data = values[1:]
+    base_row_index = 2  # ilk veri satırı
 
-        if "robot 1 başarılı" not in ac.lower():
+    def _is_done_for_robot2(val: str) -> bool:
+        if not val: return False
+        s = val.lower()
+        return ("robot 2 ✅" in s) or ("robot 2 ❌" in s)
+
+    def _has_robot1_ok(val: str) -> bool:
+        return bool(val) and ("robot 1 ✅" in val.lower())
+
+    # işlenecek satırlar: Robot 1 ✅ var, Robot 2 yok, H/I veya longtext eksik
+    todo: List[Tuple[int, List[str]]] = []
+    for i, row in enumerate(data, start=base_row_index):
+        try:
+            ac_val = row[cols.AC - 1] if len(row) >= cols.AC else ""
+            if not _has_robot1_ok(ac_val) or _is_done_for_robot2(ac_val):
+                continue
+
+            has_title   = len(row) >= cols.H and row[cols.H - 1].strip() != ""
+            has_summary = len(row) >= cols.I and row[cols.I - 1].strip() != ""
+            has_long    = False
+            if longtext_col is not None and len(row) >= longtext_col:
+                has_long = row[longtext_col - 1].strip() != ""
+
+            if has_title and has_summary and (has_long or longtext_col is None):
+                continue
+
+            todo.append((i, row))
+            if len(todo) >= CRAFTER_MAX_ROWS:
+                break
+        except Exception:
             continue
-        if not title or not link or not cat:
-            continue
-        if h or i_tx or j:
-            continue
 
-        todo.append((i, title, link, cat, src, lang))
+    if not todo:
+        print("ContentCrafter: işlenecek satır yok.")
+        return
 
-    if CRAFTER_MAX_ROWS and len(todo) > CRAFTER_MAX_ROWS:
-        todo = todo[:CRAFTER_MAX_ROWS]
+    print(f"ContentCrafter: hedef {len(todo)} satır.")
 
-    print(f"İşlenecek satır: {len(todo)} (yalnızca AC='Robot 1 Başarılı')")
+    updates_lock = threading.Lock()
+    updates: List[Tuple[int, int, str]] = []  # (row_idx, col_idx, value)
 
-    processed = 0
-    # batch içi duplicate kontrolü için embedding cache
-    batch_dup_cache: Dict[str, List[Tuple[str, List[float]]]] = {}
+    def stage(r, c, v):
+        with updates_lock:
+            updates.append((r, c, v))
 
-    for start in range(0, len(todo), CRAFTER_BATCH):
-        batch = todo[start:start + CRAFTER_BATCH]
+    def process_row(row_idx: int, row: List[str]) -> None:
+        try:
+            source_title = row[cols.F - 1] if len(row) >= cols.F else ""
+            link         = row[cols.G - 1] if len(row) >= cols.G else ""
+            category     = row[cols.C - 1] if len(row) >= cols.C else ""
 
-        for (row_idx, title, link, cat, src, lang) in batch:
-            try:
-                # — Opsiyonel duplicate (sadece aynı batch içinde, hızlı)
-                if _duplicate_in_batch(cat, title, batch_dup_cache):
-                    ws.update_cell(row_idx, cols.AC, "Tekrarlanan Haber - Atlandı")
-                    ws.update_cell(row_idx, cols.AD, f"Batch dup ≥ {DUP_THRESHOLD}")
-                    continue
+            if not source_title or not link:
+                prev_ac = row[cols.AC - 1] if len(row) >= cols.AC else ""
+                stage(row_idx, cols.AC, _compose_status_block(prev_ac, 2, False))
+                return
 
-                # — İçerik üretimi
-                out = generate_content(
-                    original_title=title,
-                    original_text="",
-                    original_lang=lang or "en",
-                    target_lang="tr",
-                    source_name=src
-                )
+            need_title   = not (len(row) >= cols.H and row[cols.H - 1].strip())
+            need_summary = not (len(row) >= cols.I and row[cols.I - 1].strip())
+            need_long    = (longtext_col is not None) and not (len(row) >= longtext_col and row[longtext_col - 1].strip())
 
-                new_h = (out.get("title") or "").strip()
-                new_i = (out.get("summary") or "").strip()
-                new_j = (out.get("long") or "").strip()
+            body_text = ""
+            if need_summary or need_long:
+                html = fetch_html(link)
+                if html:
+                    body_text = extract_article_text(html)
 
-                # --- Yumuşak düzeltmeler ---
-                # Başlık: boşsa orijinal başlık; sonra max’a göre kısalt
-                if not new_h:
-                    new_h = title.strip()
-                new_h = _clip_title(new_h)
+            # Başlık — 55–85 hedef; asla TITLE_MAX_CHARS'ı geçme
+            if need_title:
+                t_prompt = build_title_prompt(source_title.strip()[:INPUT_MAX_CHARS], category)
+                new_title = generate_text(t_prompt).strip()
+                if len(new_title) > TITLE_MAX_CHARS:
+                    new_title = new_title[:TITLE_MAX_CHARS].rstrip()
+                if len(new_title) < max(10, TITLE_MIN_CHARS // 2):
+                    # ikinci deneme: biraz daha uzun iste
+                    t_prompt2 = t_prompt + "\n\nDaha kapsamlı ama yine de yalın bir başlık yaz."
+                    new_title2 = generate_text(t_prompt2).strip()
+                    if len(new_title2) > TITLE_MAX_CHARS:
+                        new_title2 = new_title2[:TITLE_MAX_CHARS].rstrip()
+                    if len(new_title2) >= max(10, TITLE_MIN_CHARS // 2):
+                        new_title = new_title2
+                    else:
+                        # yine kısa ise mevcut başlığı kırparak kullan
+                        nt = source_title.strip()
+                        if len(nt) > TITLE_MAX_CHARS:
+                            nt = nt[:TITLE_MAX_CHARS].rstrip()
+                        new_title = nt
+                stage(row_idx, cols.H, new_title)
 
-                # Özet: boşsa uzun metinden ilk cümle; o da yoksa başlık
-                if not new_i:
-                    first = ""
-                    txt = (new_j or "").strip()
-                    if txt:
-                        for sep in [".", "!", "?"]:
-                            p = txt.find(sep)
-                            if p > 20:
-                                first = txt[:p+1].strip()
-                                break
-                    if not first:
-                        first = txt or new_h
-                    new_i = first
-                # Özet kelime limiti
-                new_i = _trim_words(new_i, SUMMARY_MAX_WORDS)
+            # Özet — gövdeye dayalı, tek paragraf
+            if need_summary:
+                s_prompt = build_summary_prompt(source_title, body_text or source_title, link)
+                new_summary = generate_text(s_prompt).strip()
+                new_summary = " ".join(new_summary.split())
+                stage(row_idx, cols.I, new_summary)
 
-                # Ufak kalite: bağıran başlıkları sakinleştir
-                if new_h.isupper():
-                    new_h = new_h.capitalize()
+            # Uzun metin — J sütunu (veya bulunan sütun)
+            if need_long:
+                a_prompt = build_article_prompt(source_title, body_text or source_title, link, category)
+                article = generate_text(a_prompt).strip()
+                words = article.split()
 
-                # — Sheet’e yaz
-                ws.update_cell(row_idx, cols.H,  new_h)
-                ws.update_cell(row_idx, cols.I,  new_i)
-                ws.update_cell(row_idx, cols.J,  new_j)
-                ws.update_cell(row_idx, cols.AC, "Robot 1 Başarılı / Robot 2 Başarılı")
-                ws.update_cell(row_idx, cols.AD, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                processed += 1
+                # çok kısa geldiyse daha kapsamlı yazmasını iste
+                if len(words) < max(ARTICLE_MIN_WORDS - 50, 200):
+                    retry_prompt = a_prompt + "\n\nLütfen daha kapsamlı ve ayrıntılı yaz. Veri, tarih ve bağlam ekle."
+                    article2 = generate_text(retry_prompt).strip()
+                    if len(article2.split()) > len(words):
+                        article = article2
+                        words = article.split()
 
-            except Exception as e:
-                ws.update_cell(row_idx, cols.AC, "Robot 1 Başarılı / Robot 2 Hata")
-                ws.update_cell(row_idx, cols.AD, f"{type(e).__name__}: {e}")
-                traceback.print_exc()
+                # aşırı uzun ise nazikçe kısalt (1.6x esnek)
+                soft_cap = int(ARTICLE_MAX_WORDS * 1.6)
+                if len(words) > soft_cap:
+                    article = " ".join(words[:soft_cap])
 
-        # quota-dostu bekleme
+                stage(row_idx, longtext_col, article)
+
+            # Statü ✅
+            prev_ac = row[cols.AC - 1] if len(row) >= cols.AC else ""
+            ac_val = _compose_status_block(prev_ac, 2, True)
+            stage(row_idx, cols.AC, ac_val)
+
+        except Exception:
+            prev_ac = row[cols.AC - 1] if len(row) >= cols.AC else ""
+            ac_val = _compose_status_block(prev_ac, 2, False)
+            stage(row_idx, cols.AC, ac_val)
+
+    # Paralel işleme
+    with ThreadPoolExecutor(max_workers=CRAFTER_CONCURRENCY) as ex:
+        futures = [ex.submit(process_row, r, row) for (r, row) in todo]
+        for _ in as_completed(futures):
+            pass
+
+    # Toplu yazım (büyük batch'ler halinde)
+    _flush_updates(ws, updates)
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    note = f"ContentCrafter bitti: toplam={len(todo)} — {now_str}"
+    try:
+        ws.update_cell(len(ws.get_all_values()), cols.AD, note)
+    except Exception:
+        pass
+    print(note)
+
+def _flush_updates(ws: gspread.Worksheet, updates: List[Tuple[int, int, str]]):
+    if not updates:
+        return
+    for i in range(0, len(updates), CRAFTER_BATCH):
+        chunk = updates[i:i+CRAFTER_BATCH]
+        data = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for (r, c, v) in chunk]
+        body = {"valueInputOption": "RAW", "data": data}
+        ws.spreadsheet.values_batch_update(body)
         time.sleep(CRAFTER_SLEEP_MS / 1000.0)
-
-    print(f"✓ Robot 2 bitti — işlendi: {processed}")
 
 if __name__ == "__main__":
     run()

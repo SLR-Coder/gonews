@@ -26,7 +26,6 @@ FEEDS = {
     "dunya_gundemi": [
         ("BBC World News", "https://feeds.bbci.co.uk/news/world/rss.xml"),
         ("The Guardian World", "https://www.theguardian.com/world/rss"),
-        ("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
     ],
     "turkiye_gundemi": [
         ("NTV Gündem", "https://www.ntv.com.tr/gundem.rss"),

@@ -1,487 +1,848 @@
 # robots/visual_styler.py
 # -*- coding: utf-8 -*-
-
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, io, uuid, time, re, requests, logging, traceback
-from typing import List, Tuple, Dict
+import os, io, re, uuid, time, json, hashlib, datetime, unicodedata
+from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+import requests
+from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+import gspread
+from google.cloud import storage
+try:
+    from google.cloud import vision
+    VISION_AVAILABLE = True
+except Exception:
+    VISION_AVAILABLE = False
+
+# Proje yardımcıları
 from utils.auth import get_gspread_client
 from utils.schema import resolve_columns
-from google.cloud import storage, vision
+try:
+    from utils.gemini import generate_text
+except Exception:
+    generate_text = None
 
-# ====== Ayarlar (.env'den ve sabitler) ======
-SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
-BUCKET_NAME = os.environ.get('GOOGLE_STORAGE_BUCKET')
-NEWS_TAB = os.environ.get("NEWS_TAB", "News")
-USE_VISION = os.environ.get("USE_VISION", "1").lower() not in ("0", "false")
+# ================== ENV & SABİTLER ==================
+NEWS_TAB              = os.environ.get("NEWS_TAB", "News")
+GOOGLE_STORAGE_BUCKET = os.environ.get("GOOGLE_STORAGE_BUCKET", "")
+REQUEST_TIMEOUT       = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+USER_AGENT            = os.environ.get("USER_AGENT", "GoNewsBot/1.0 (+https://example.com)")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+CRAFTER_CONCURRENCY   = int(os.environ.get("CRAFTER_CONCURRENCY", "8"))
+BATCH_SIZE            = int(os.environ.get("CRAFTER_BATCH", "40"))
+BATCH_SLEEP_MS        = int(os.environ.get("CRAFTER_SLEEP_MS", "800"))
 
-vision_client = None
-if USE_VISION:
+USE_VISION            = os.environ.get("USE_VISION", "1") in ("1","true","True")
+MAX_WEB_IMAGES        = int(os.environ.get("MAX_WEB_IMAGES", "5"))
+
+MIN_W, MIN_H          = 800, 450
+
+# GCS: imzalı URL süresi (maks 7 gün)
+SIGN_URL_TTL_HOURS    = min(max(int(os.environ.get("SIGN_URL_TTL_HOURS", "168")), 1), 168)
+STORAGE_PUBLIC        = os.environ.get("STORAGE_PUBLIC", "0") in ("1","true","True")
+GCS_BASE_PATH         = os.environ.get("GCS_BASE_PATH", "news")
+
+# Boyutlar
+SIZE_TG   = (1080, 1350)     # Telegram 4:5
+SIZE_SOC  = (1200, 675)      # X/BS/LI 16:9
+
+# Fontlar
+FONT_BOLD_PATH  = "media/font/Montserrat-Bold.ttf"
+FONT_BLACK_PATH = "media/font/Montserrat-Black.ttf"
+FONT_REG_PATH   = "media/font/Montserrat-Regular.ttf"
+
+LOGO_PATH       = os.environ.get("LOGO_PATH", "media/logo.png")
+LOGO_MAX_W      = 156
+LOGO_PAD        = 24
+
+# 0.5 cm ≈ 19px
+FRAME_PX_TG     = int(os.environ.get("FRAME_PX_TG", "20"))
+FRAME_PX_SOC    = int(os.environ.get("FRAME_PX_SOC", "20"))
+
+HIGHLIGHT_AI    = os.environ.get("HIGHLIGHT_AI", "1") in ("1","true","True")
+
+HEADERS = {"User-Agent": USER_AGENT}
+SESS = requests.Session(); SESS.headers.update(HEADERS)
+
+# ✓ Kategori bandı köşe yarıçapı (px) — istersen .env ile PILL_CORNER_RADIUS ayarlayabilirsin
+PILL_CORNER_RADIUS = int(os.environ.get("PILL_CORNER_RADIUS", "20"))
+
+# ================== YARDIMCI GENELLER ==================
+def _compose_status_block(current: Optional[str], robot_no: int, ok: bool) -> str:
+    kept=[]
+    for ln in (current or "").splitlines():
+        s=ln.strip()
+        if not s: continue
+        if re.match(rf"^Robot\s+{robot_no}\s+[✅❌]$", s):
+            continue
+        if re.match(r"^Robot\s+\d+\s+[✅❌]$", s):
+            kept.append(s)
+    kept.append(f"Robot {robot_no} {'✅' if ok else '❌'}")
+    return "\n".join(kept)
+
+def _slug(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("utf-8","ignore")
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+    return s or "news"
+
+def _open_image(b: bytes) -> Optional[Image.Image]:
+    try: return Image.open(io.BytesIO(b)).convert("RGB")
+    except Exception: return None
+
+def _fetch(url: str) -> Optional[bytes]:
     try:
-        if 'GCP_PROJECT' in os.environ:
-            vision_client = vision.ImageAnnotatorClient()
-        elif os.path.exists('service_account.json'):
-            vision_client = vision.ImageAnnotatorClient.from_service_account_json('service_account.json')
-        else:
-            logger.warning("Lokalde Vision API için 'service_account.json' bulunamadı.")
-            USE_VISION = False
-    except Exception as e:
-        logger.error(f"Vision API istemcisi başlatılamadı: {e}")
-        vision_client = None
-        USE_VISION = False
+        r=SESS.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code==200 and r.content: return r.content
+    except Exception: pass
+    return None
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOGO_PATH = os.path.join(BASE_DIR, "media", "logo.png")
-FONT_DIR = os.path.join(BASE_DIR, "media", "font")
-SAVE_DIR = os.path.join(BASE_DIR, "styled_images")
-os.makedirs(SAVE_DIR, exist_ok=True)
+def _draw_white_frame(img: Image.Image, thickness_px: int):
+    d=ImageDraw.Draw(img); w,h=img.size
+    d.rectangle([0,0,w-1,h-1], outline=(255,255,255), width=thickness_px)
 
-WEB_SIZE = (1280, 720)
-TG_SIZE  = (1080, 1350)
-MIN_WIDTH, MIN_HEIGHT = 500, 300
-SARI = (255, 206, 43); BEYAZ = (255, 255, 255); SIYAH = (0, 0, 0)
-SARI_BG_RGBA = (255, 206, 43, 255)
-BEYAZ_RGBA = (255, 255, 255, 255)
-SIYAH_RGBA = (0, 0, 0, 255)
-BORDER_PX = 19
-FONT_BLACK = os.path.join(FONT_DIR, "Montserrat-Black.ttf")
-FONT_BOLD = os.path.join(FONT_DIR, "Montserrat-Bold.ttf")
-FONT_LIGHT = os.path.join(FONT_DIR, "Montserrat-Light.ttf")
-LOGO_SIZE = (180, 60)
-CATEGORY_PILL_SIZE = 50
-WEB_TITLE_SIZE = 64
-TG_TITLE_SIZE = 72
-TG_SUMMARY_SIZE = 34
-TITLE_LINE_SPACING = 10
-SUMMARY_LINE_SPACING = 8
-CM_IN_PX = 38
-WEB_GAP_DELTA_PX = -int(0.2 * CM_IN_PX)
-TG_TITLE_LINE_SPACING_EXTRA = 4
-TG_SUMMARY_LINE_SPACING_EXTRA = 4
-PILL_EXTRA_BOTTOM_PAD_PX = 6
-PILL_REDUCE_TOP_PAD_PX = 4
+def _paste_logo(img: Image.Image):
+    try:
+        if not os.path.exists(LOGO_PATH): return
+        logo=Image.open(LOGO_PATH).convert("RGBA")
+        r=min(1.0, LOGO_MAX_W/max(1,logo.width))
+        if r<1.0: logo=logo.resize((int(logo.width*r), int(logo.height*r)), Image.LANCZOS)
+        img.paste(logo,(LOGO_PAD,LOGO_PAD),logo)
+    except Exception: pass
 
-TR_STOPWORDS = { 
-     "ve","veya","ile","ama","fakat","ancak","çünkü","için","de","da","ki","ya","ya-da","gibi", 
-     "göre","kadar","üzere","diye","hem","yine","sonra","önce","ayrıca","aynı","artık","hiç", 
-     "hiçbir","şu","an","zaten","böyle","böylece","tüm","her","bazı","bu","şu","o","bir","çok","az","daha" 
+# ========== VISION: yazı/logo kontrolü ==========
+def _check_text_on_image(im: Image.Image) -> bool:
+    if not (USE_VISION and VISION_AVAILABLE):
+        return False
+    try:
+        client = vision.ImageAnnotatorClient()
+        buf = io.BytesIO(); im.save(buf, format="JPEG", quality=92); buf.seek(0)
+        vimg = vision.Image(content=buf.read())
+        t = client.text_detection(image=vimg)
+        logos = getattr(client.logo_detection(image=vimg), "logo_annotations", []) or []
+        texts = getattr(t, "text_annotations", []) or []
+        return len(texts) > 1 or len(logos) > 0
+    except Exception:
+        return False
+
+def _blur_boxes(im: Image.Image, boxes, radius=14) -> Image.Image:
+    if not boxes: return im
+    base=im.copy()
+    for (x1,y1,x2,y2) in boxes:
+        x1=max(0,x1); y1=max(0,y1); x2=min(base.width,x2); y2=min(base.height,y2)
+        if x2-x1<=0 or y2-y1<=0: continue
+        region=base.crop((x1,y1,x2,y2)).filter(ImageFilter.GaussianBlur(radius))
+        base.paste(region,(x1,y1))
+    return base
+
+def _vision_clean(im: Image.Image) -> Image.Image:
+    if not (USE_VISION and VISION_AVAILABLE): return im
+    try:
+        client=vision.ImageAnnotatorClient()
+        buf=io.BytesIO(); im.save(buf, format="JPEG", quality=92); buf.seek(0)
+        vimg=vision.Image(content=buf.read())
+
+        boxes=[]
+        for l in getattr(client.logo_detection(image=vimg),"logo_annotations",[]) or []:
+            for poly in getattr(l,"bounding_polys",[]):
+                xs=[v.x for v in poly.vertices]; ys=[v.y for v in poly.vertices]
+                boxes.append((min(xs),min(ys),max(xs),max(ys)))
+        t=client.text_detection(image=vimg)
+        for a in getattr(t,"text_annotations",[])[1:]:
+            vs=a.bounding_poly.vertices; xs=[v.x for v in vs]; ys=[v.y for v in vs]
+            boxes.append((min(xs),min(ys),max(xs),max(ys)))
+
+        boxes=[b for b in boxes if (b[2]-b[0])*(b[3]-b[1])>=900]
+        return _blur_boxes(im, boxes, radius=14)
+    except Exception:
+        return im
+
+# ========== SAYFA KAZIMA + ADAY ==========
+def _best_from_srcset(srcset: str) -> Optional[str]:
+    best=None; best_w=-1
+    for part in (srcset or "").split(","):
+        seg=part.strip().split()
+        if not seg: continue
+        url=seg[0]; w=0
+        if len(seg)>1 and seg[1].endswith("w"):
+            try: w=int(seg[1][:-1])
+            except: w=0
+        if w>best_w: best=url; best_w=w
+    return best
+
+BAD_HINT = re.compile(r"(sprite|logo|placeholder|icon|ads|tracking)", re.I)
+
+def _score_candidate(url, meta, title):
+    score=0
+    src = meta.get("src","")
+    if src=="og": score+=100
+    if src=="twitter": score+=95
+    if src=="primary": score+=90
+    if src=="article": score+=60
+    w,h = meta.get("w",0), meta.get("h",0)
+    if w and h:
+        score += (w*h)/1_000_000
+        ar = w/max(1,h)
+        if ar<0.55 or ar>2.2: score -= 40
+    kws=[k for k in re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşüİ0-9]+", title or "") if len(k)>=4][:3]
+    u=url.lower()
+    if any(k.lower() in u for k in kws): score+=25
+    if BAD_HINT.search(url): score-=100
+    return score
+
+def _scrape_candidates(page_url: str, title: str) -> List[dict]:
+    out=[]
+    html=_fetch(page_url) if page_url else None
+    if not html: return out
+    soup=BeautifulSoup(html,"html.parser")
+
+    def add(u, src, w=0, h=0):
+        if not u: return
+        u=requests.compat.urljoin(page_url,u)
+        out.append({"url":u,"src":src,"w":w,"h":h})
+
+    for prop, src in [("og:image","og"), ("twitter:image","twitter"), ("twitter:image:src","twitter")]:
+        t=soup.find("meta",attrs={"property":prop}) or soup.find("meta",attrs={"name":prop})
+        if t and t.get("content"): add(t["content"], src)
+
+    for sc in soup.find_all("script",attrs={"type":"application/ld+json"}):
+        try: data=json.loads(sc.string or "{}")
+        except Exception: continue
+        items=data if isinstance(data,list) else [data]
+        for it in items:
+            if not isinstance(it,dict): continue
+            t=it.get("@type")
+            if t in ("NewsArticle","Article","ImageObject"):
+                im=it.get("primaryImageOfPage") or it.get("image") or it.get("thumbnailUrl")
+                if isinstance(im,str): add(im,"primary")
+                elif isinstance(im,list) and im: add(im[0],"primary")
+            if t=="ImageGallery":
+                for e in it.get("itemListElement") or []:
+                    if isinstance(e,dict) and str(e.get("position"))=="1":
+                        im=e.get("image") or e.get("url")
+                        if im: add(im,"primary")
+
+    for fig in soup.select("article img, .article img, .content img, figure img"):
+        u=fig.get("src") or fig.get("data-src") or fig.get("data-original") or fig.get("data-lazy-src")
+        if not u: continue
+        try: w=int(fig.get("width") or 0); h=int(fig.get("height") or 0)
+        except: w=h=0
+        add(u,"article",w,h)
+
+    for s in soup.find_all("source"):
+        ss=s.get("srcset") or s.get("data-srcset")
+        if ss:
+            best=_best_from_srcset(ss)
+            if best: add(best,"article")
+
+    return out
+
+def pick_images(row, cols) -> Tuple[List[Image.Image], List[str]]:
+    page_url = row[cols.G-1].strip() if len(row) >= cols.G else ""
+    title    = row[cols.H-1] if len(row)>=cols.H else ""
+    cand = []
+    notes=[]
+
+    if len(row)>=cols.K and row[cols.K-1].strip():
+        cand.append({"url": row[cols.K-1].strip(), "src":"manual"})
+
+    cand += _scrape_candidates(page_url, title)
+
+    seen_url=set(); seen_hash=set(); pool=[]
+    for c in cand:
+        url=c["url"]
+        if url in seen_url: continue
+        seen_url.add(url)
+        b=_fetch(url)
+        if not b: continue
+        h=hashlib.sha1(b).hexdigest()
+        if h in seen_hash: continue
+        im=_open_image(b)
+        if not im: continue
+        w,hpx=im.size
+        if w<MIN_W or hpx<MIN_H: continue
+        if _check_text_on_image(im):
+            notes.append(f"Görsel üzerinde yazı tespit edildi: {url}")
+        seen_hash.add(h)
+        c["w"],c["h"],c["im"]=w,hpx,im
+        c["score"]=_score_candidate(url,c,title)
+        pool.append(c)
+
+    pool.sort(key=lambda x:x["score"], reverse=True)
+    return [c["im"] for c in pool[:MAX_WEB_IMAGES]], notes
+
+# ========== KIRPMA & ODAK ==========
+def _detect_face_box(im: Image.Image) -> Optional[Tuple[int,int,int,int]]:
+    if not (USE_VISION and VISION_AVAILABLE): return None
+    try:
+        client=vision.ImageAnnotatorClient()
+        buf=io.BytesIO(); im.save(buf, format="JPEG", quality=90); buf.seek(0)
+        vimg=vision.Image(content=buf.read())
+        faces=(client.face_detection(image=vimg).face_annotations or [])
+        if not faces: return None
+        def bbox(f):
+            vs=f.bounding_poly.vertices
+            xs=[v.x for v in vs]; ys=[v.y for v in vs]
+            return (min(xs),min(ys),max(xs),max(ys))
+        boxes=[bbox(f) for f in faces]
+        boxes.sort(key=lambda b:(b[2]-b[0])*(b[3]-b[1]), reverse=True)
+        return boxes[0]
+    except Exception:
+        return None
+
+def _cover_focus(im: Image.Image, target_wh: Tuple[int,int], face_box=None, bias_up=0.0):
+    tw, th = target_wh
+    w, h = im.size
+    scale = max(tw / w, th / h)
+
+    nw, nh = int(w * scale), int(h * scale)
+    im2 = im.resize((nw, nh), Image.LANCZOS)
+
+    # odak merkezi
+    cx, cy = nw // 2, nh // 2
+    if face_box:
+        x1, y1, x2, y2 = face_box
+        cx = int((x1 + x2) / 2 * scale)
+        cy = int((y1 + y2) / 2 * scale)
+
+    cy = int(cy - bias_up * th)
+
+    left = max(0, min(nw - tw, cx - tw // 2))
+    top  = max(0, min(nh - th, cy - th // 2))
+
+    # ✅ Hedef boyut: (tw, th)
+    return im2.crop((left, top, left + tw, top + th))
+
+
+# ========== METİN/RENK ==========
+def _font(path, size):
+    # Hata gizleme kaldırıldı. Font bulunamazsa program hata verip duracak.
+    # Bu, font yolunun yanlış olduğunu anlamanızı sağlar.
+    # Lütfen "media/font/" klasörlerinin ve .ttf dosyalarının doğru yerde olduğundan emin olun.
+    return ImageFont.truetype(path, size)
+
+def tr_upper(s: str) -> str:
+    s = s or ""
+    s = s.replace('ı', 'I').replace('i', 'İ')
+    return s.upper()
+
+def _fix_category_text(raw: str) -> str:
+    # Fazladan boşluk yok; padding gerçek değerlerden gelsin
+    s = (raw or "").replace("_", " ").replace("-", " ").strip()
+
+    # ASCII’ye indir ve map’le (aksan düzeltme)
+    repl = str.maketrans({
+        "ç":"c","Ç":"c","ğ":"g","Ğ":"g","ı":"i","İ":"i",
+        "ö":"o","Ö":"o","ş":"s","Ş":"s","ü":"u","Ü":"u",
+    })
+    key = re.sub(r"\s+", " ", s.translate(repl)).strip().upper()
+
+    CANON = {
+        "TURKIYE GUNDEMI": "TÜRKİYE GÜNDEMİ",
+        "GUNDEM":          "GÜNDEM",
+        "EKONOMI":         "EKONOMİ",
+        "TEKNOLOJI":       "TEKNOLOJİ",
+        "KULTUR SANAT":    "KÜLTÜR & SANAT",
+        "KULTUR & SANAT":  "KÜLTÜR & SANAT",
+        "DUNYA":           "DÜNYA",
+        "SAGLIK":          "SAĞLIK",
+        "SPOR":            "SPOR",
+        "BILIM":           "BİLİM",
+    }
+    if key in CANON:
+        s = CANON[key]
+
+    # TR upper
+    return s.replace("i", "İ").replace("ı", "I").upper()
+
+# ↓↓↓ BUNU EKLE (heuristic’ten ÖNCE olsun)
+STOPWORDS_TR = {
+    "ve","ile","de","da","bir","the","of","in","on","and","to",
+    "ya","ama","mi","mı","mu","mü"
 }
 
-# ===================== TÜM GÖRSEL İŞLEME YARDIMCILARI (Sizin Kodunuz) =====================
 
-def download_image(url: str, tries=3, timeout=12): 
-     last = None 
-     for _ in range(tries): 
-         try: 
-             r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"}) 
-             r.raise_for_status() 
-             img = Image.open(io.BytesIO(r.content)) 
-             if img.mode != "RGBA": img = img.convert("RGBA") 
-             return img 
-         except Exception as e: 
-             last = e; time.sleep(1.0) 
-     raise last 
+def _choose_highlights_heuristic(text: str):
+    words=[w.strip(",.!?:;()\"'“”") for w in (text or "").split()]
+    scored=[]
+    for w in words:
+        score=(any(c.isdigit() for c in w))*3 + min(len(w),12)/10 + (w[:1].isupper())*0.6
+        if w.lower() in STOPWORDS_TR: score-=1.5
+        scored.append((score,w))
+    scored.sort(reverse=True)
+    yellow=[]; bold=[]
+    for _,w in scored:
+        if len(yellow)<2 and w not in yellow: yellow.append(w); continue
+        if len(bold)<3 and (w not in yellow) and (w not in bold): bold.append(w)
+        if len(yellow)>=2 and len(bold)>=3: break
+    return yellow,bold
 
-def validate_image(img): return img.width >= MIN_WIDTH and img.height >= MIN_HEIGHT 
-
-def _image_to_vision_image(img): 
-     buf = io.BytesIO(); img.save(buf, format='PNG') 
-     return vision.Image(content=buf.getvalue()) 
-
-def fetch_og_image(page_url: str): 
-     try: 
-         html = requests.get(page_url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}).text 
-         m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I) 
-         if m: return m.group(1) 
-     except Exception: pass 
-     return None 
-
-def find_better_image_with_vision(img): 
-     if not vision_client: return None 
-     try: 
-         resp = vision_client.web_detection(image=_image_to_vision_image(img)) 
-         wd = resp.web_detection 
-         urls = [] 
-         if wd.full_matching_images:    urls += [x.url for x in wd.full_matching_images] 
-         if wd.partial_matching_images: urls += [x.url for x in wd.partial_matching_images] 
-         seen, cand = set(), [] 
-         for u in urls: 
-             if u and u not in seen: 
-                 cand.append(u); seen.add(u) 
-             if len(cand) >= 5: break 
-         for u in cand: 
-             try: 
-                 alt = download_image(u, tries=2) 
-                 if validate_image(alt): return alt 
-             except: pass 
-     except Exception: pass 
-     return None 
-
-def smart_get_image(img_url: str|None, page_url: str|None=None): 
-     img = None 
-     if img_url: 
-         try: img = download_image(img_url) 
-         except Exception: img = None 
-     if img and validate_image(img): return img, img_url, "" 
-     if page_url: 
-         og = fetch_og_image(page_url) 
-         if og: 
-             try: 
-                 alt = download_image(og) 
-                 if validate_image(alt): return alt, og, "og:image" 
-             except Exception: pass 
-     if img and USE_VISION: 
-         alt2 = find_better_image_with_vision(img) 
-         if alt2 and validate_image(alt2): return alt2, img_url, "vision-web-detection" 
-     return (img if img else None), (img_url or ""), "fallback" 
-
-def get_text_size(draw, text, font): 
-     x1,y1,x2,y2 = draw.textbbox((0,0), text, font=font) 
-     return (x2-x1, y2-y1) 
-
-def draw_white_border(img, border=BORDER_PX): 
-     w,h = img.size 
-     canvas = Image.new("RGBA", (w+2*border, h+2*border), BEYAZ_RGBA) 
-     canvas.paste(img, (border,border), img if img.mode=="RGBA" else None) 
-     return canvas 
-
-def draw_logo(img, pos=(20,20), size=(180,60)): 
-     try: 
-         if os.path.exists(LOGO_PATH): 
-             lg = Image.open(LOGO_PATH).convert("RGBA").resize(size, Image.Resampling.LANCZOS) 
-             img.paste(lg, pos, lg) 
-     except: pass 
-     return img 
-
-def save_jpg(img, path): 
-     if img.mode == "RGBA": 
-         bg = Image.new("RGB", img.size, (0,0,0)) 
-         bg.paste(img, mask=img.split()[-1]); img = bg 
-     img.save(path, "JPEG", quality=90, optimize=True, progressive=True)
-
-def blur_box(img, box, radius=16): 
-     x1,y1,x2,y2 = map(int, box) 
-     x1,y1 = max(0,x1), max(0,y1) 
-     x2,y2 = min(img.width,x2), min(img.height,y2) 
-     if x2<=x1 or y2<=y1: return img 
-     crop = img.crop((x1,y1,x2,y2)).filter(ImageFilter.GaussianBlur(radius)) 
-     img.paste(crop, (x1,y1)); return img 
-
-def detect_and_blur_logos(img): 
-     if not vision_client: return img 
-     try: 
-         resp = vision_client.logo_detection(image=_image_to_vision_image(img)) 
-         if not resp or not resp.logo_annotations: return img 
-         for ann in resp.logo_annotations: 
-             v = ann.bounding_poly.vertices 
-             xs, ys = [p.x for p in v], [p.y for p in v] 
-             img = blur_box(img, (min(xs),min(ys),max(xs),max(ys)), radius=18) 
-     except Exception: pass 
-     return img 
-
-def smart_crop_with_ai(img, target_w, target_h): 
-     if vision_client: 
-         try: 
-             resp = vision_client.crop_hints( 
-                 image=_image_to_vision_image(img), 
-                 image_context={"crop_hints_params": {"aspect_ratios": [target_w/target_h]}} 
-             ) 
-             hints = resp.crop_hints_annotation.crop_hints 
-             if hints: 
-                 v = hints[0].bounding_poly.vertices 
-                 xs, ys = [p.x for p in v], [p.y for p in v] 
-                 crop = img.crop((min(xs),min(ys),max(xs),max(ys))) 
-                 return crop.resize((target_w,target_h), Image.Resampling.LANCZOS) 
-         except Exception: pass 
-     aspect = img.width / img.height 
-     t = target_w / target_h 
-     if aspect > t: 
-         new_w = int(img.height * t) 
-         left = (img.width - new_w)//2 
-         crop = img.crop((left,0,left+new_w,img.height)) 
-     else: 
-         new_h = int(img.width / t) 
-         top = (img.height - new_h)//2 
-         crop = img.crop((0,top,img.width,top+new_h)) 
-     return crop.resize((target_w,target_h), Image.Resampling.LANCZOS) 
-
-def pick_emphasis_tokens(text, max_yellow=2, max_bold=3): 
-     tokens = re.findall(r"[0-9]+(?:\.[0-9]+)?%?|[A-Za-zÇĞİÖŞÜçğıöşü]+", text) 
-     words = [t for t in tokens if t and t.lower() not in TR_STOPWORDS] 
-     scored = [] 
-     for w in words: 
-         s = 0 
-         if re.search(r"[0-9]", w): s += 2 
-         if w.endswith("%"): s += 1 
-         if w[0].isupper(): s += 1 
-         s += min(2, max(0, len(w)-4)/3) 
-         scored.append((s, w)) 
-     scored.sort(reverse=True) 
-     return {w for _,w in scored[:max_yellow]}, {w for _,w in scored[max_yellow:max_yellow+max_bold]} 
-
-def draw_pill_two_round_corners(img, text, center_x, center_y, base_font_size=CATEGORY_PILL_SIZE): 
-     font = ImageFont.truetype(FONT_BLACK, int(base_font_size * 1.5)) 
-     draw = ImageDraw.Draw(img) 
-     text_w, text_h = get_text_size(draw, text, font) 
-     pad_y_top = max(0, int(text_h * 0.45) - PILL_REDUCE_TOP_PAD_PX) 
-     pad_y_bot = int(text_h * 0.45) + PILL_EXTRA_BOTTOM_PAD_PX 
-     pad_x = int(text_h * 0.45) 
-     w, h = text_w + 2*pad_x, text_h + pad_y_top + pad_y_bot 
-     left, top = center_x - w//2, center_y - h//2 
-     right, bottom = left + w, top + h 
-     mask = Image.new("L", (w, h), 0) 
-     mdraw = ImageDraw.Draw(mask) 
-     r = int(h * 0.45) 
-     mdraw.rounded_rectangle((0,0,w,h), radius=r, fill=255) 
-     mdraw.rectangle((w-r, 0, w, r), fill=255) 
-     mdraw.rectangle((0, h-r, r, h), fill=255) 
-     pill = Image.new("RGBA", (w,h), SARI + (255,)) 
-     shadow = Image.new('RGBA', (w+8, h+8), (0,0,0,0)) 
-     sd = ImageDraw.Draw(shadow) 
-     sd.rounded_rectangle((4,4,w+4,h+4), radius=r, fill=(0,0,0,120)) 
-     img.alpha_composite(shadow, (left-4, top-4)) 
-     img.paste(pill, (left, top), mask) 
-     draw.text((left + pad_x, top + pad_y_top - 1), text, font=font, fill=SIYAH + (255,)) 
-     return img, (left, top, right, bottom) 
-
-def draw_words_emphasized_center(img, area, text, font_regular_path, font_bold_path, size, yellow_words, bold_words, line_spacing): 
-     left, top, right, bottom = area 
-     draw = ImageDraw.Draw(img) 
-     f_r = ImageFont.truetype(font_regular_path, size) 
-     f_b = ImageFont.truetype(font_bold_path, size) 
-     words = text.split() 
-     lines, cur = [], "" 
-     for w in words: 
-         test = (cur + " " + w).strip() 
-         if get_text_size(draw, test, f_r)[0] <= (right-left): cur = test 
-         else: 
-             if cur: lines.append(cur); cur = w 
-     if cur: lines.append(cur) 
-     line_h = get_text_size(draw, "Ay", f_r)[1] 
-     total_h = len(lines)*line_h + (len(lines)-1)*line_spacing 
-     y = top + max(0, ((bottom-top)-total_h)//2) 
-     space_w,_ = get_text_size(draw," ", f_r) 
-     for line in lines: 
-         tokens = line.split() 
-         w_sum = 0 
-         for t in tokens: 
-             fw = t.strip(",.!?;:") 
-             font = f_b if fw in bold_words else f_r 
-             w_sum += get_text_size(draw, t, font)[0] + space_w 
-         w_sum -= space_w 
-         x = left + max(0, ((right-left)-w_sum)//2) 
-         for t in tokens: 
-             fw = t.strip(",.!?;:") 
-             font = f_b if fw in bold_words else f_r 
-             color = SARI + (255,) if fw in yellow_words else BEYAZ_RGBA 
-             tw,_ = get_text_size(draw, t, font) 
-             if x + tw > right: break 
-             draw.text((x,y), t, font=font, fill=color) 
-             x += tw + space_w 
-         y += line_h + line_spacing 
-
-def draw_multiline_center_with_trunc(img, area, text, font_path, size, fill=BEYAZ_RGBA, max_lines=None, line_spacing=6): 
-     left, top, right, bottom = area 
-     draw = ImageDraw.Draw(img) 
-     font = ImageFont.truetype(font_path, size) 
-     words = text.split() 
-     lines, cur = [], "" 
-     for w in words: 
-         test = (cur + " " + w).strip() 
-         if get_text_size(draw, test, font)[0] <= (right-left): cur = test 
-         else: 
-             if cur: lines.append(cur); cur = w 
-     if cur: lines.append(cur) 
-     if max_lines and len(lines) > max_lines: 
-         lines = lines[:max_lines] 
-         lines[-1] = (lines[-1] + " . . .").strip() 
-     lh = get_text_size(draw, "Ay", font)[1] 
-     total_h = len(lines)*lh + (len(lines)-1)*line_spacing 
-     y = top + max(0, ((bottom-top)-total_h)//2) 
-     for line in lines: 
-         tw,_ = get_text_size(draw, line, font) 
-         x = left + ((right-left)-tw)//2 
-         draw.text((x,y), line, font=font, fill=fill) 
-         y += lh + line_spacing 
-
-def add_bottom_to_pill_fade(img, pill_box, strength=340): 
-     w,h = img.size 
-     _, pill_top, _, _ = pill_box 
-     pill_top = max(0, min(h-1, pill_top)) 
-     fade = Image.new('L', (w, h), 0) 
-     dr = ImageDraw.Draw(fade) 
-     denom = max(1, (h - 1 - pill_top)) 
-     for y in range(pill_top, h): 
-         alpha = int(strength * ((y - pill_top) / denom)) 
-         if alpha > 255: alpha = 255 
-         dr.line((0, y, w, y), fill=alpha) 
-     black = Image.new('RGBA', (w, h), (0,0,0,255)) 
-     black.putalpha(fade) 
-     return Image.alpha_composite(img, black) 
-
-def soft_midline_blend(base, mid_y, band=110, opacity_boost=1.45): 
-     w,h = base.size 
-     grad = Image.new('L', (w, band), 0) 
-     dr = ImageDraw.Draw(grad) 
-     for y in range(band): 
-         a = int(255 * (y / (band-1)) * opacity_boost) 
-         if a > 255: a = 255 
-         dr.line((0,y,w,y), fill=a) 
-     blk = Image.new('RGBA', (w, band), (0,0,0,255)); blk.putalpha(grad) 
-     base.paste(blk, (0, mid_y - band//2), blk) 
-     return base 
-
-def render_web(img_url, page_url, category, title): 
-     W,H = WEB_SIZE 
-     img, _, _ = smart_get_image(img_url, page_url) 
-     canvas = smart_crop_with_ai(img, W, H) if img else Image.new("RGBA", (W,H), (12,12,12,255)) 
-     canvas = detect_and_blur_logos(canvas) 
-     draw_logo(canvas, pos=(20,20), size=LOGO_SIZE) 
-     canvas, pill_box = draw_pill_two_round_corners( 
-         canvas, (category or "HABER").upper(), center_x=W//2, center_y=int(H*0.54) 
-     ) 
-     canvas = add_bottom_to_pill_fade(canvas, pill_box, strength=340) 
-     title_font = ImageFont.truetype(FONT_BLACK, WEB_TITLE_SIZE) 
-     line_h = title_font.getbbox("Ay")[3] 
-     default_gap = 3 * max(12, line_h // 3) 
-     gap = max(0, default_gap + WEB_GAP_DELTA_PX) 
-     title_area = (60, pill_box[3] + 23, W-60, H-60) 
-     yellow, bold = pick_emphasis_tokens(title, max_yellow=2, max_bold=3) 
-     draw_words_emphasized_center( 
-         canvas, title_area, title, 
-         font_regular_path=FONT_BLACK, font_bold_path=FONT_BOLD, 
-         size=WEB_TITLE_SIZE, yellow_words=yellow, bold_words=bold, 
-         line_spacing=TITLE_LINE_SPACING 
-     ) 
-     return draw_white_border(canvas, BORDER_PX) 
-
-def render_telegram(img_url, page_url, category, title, summary): 
-     W,H = TG_SIZE 
-     base = Image.new("RGBA", (W,H), (0,0,0,255)) 
-     mid = H//2 
-     img, _, _ = smart_get_image(img_url, page_url) 
-     if img: 
-         top_img = smart_crop_with_ai(img, W, mid) 
-         top_img = detect_and_blur_logos(top_img) 
-         base.paste(top_img, (0,0)) 
-     base = soft_midline_blend(base, mid, band=110, opacity_boost=1.45) 
-     base, pill_box = draw_pill_two_round_corners( 
-         base, (category or "HABER").upper(), center_x=W//2, center_y=mid 
-     ) 
-     title_font = ImageFont.truetype(FONT_BLACK, TG_TITLE_SIZE) 
-     line_h = title_font.getbbox("Ay")[3] 
-     default_gap = 2 * max(12, line_h // 3) 
-     gap = max(0, default_gap - int(0.1 * CM_IN_PX)) 
-     pad_x = BORDER_PX + 40 
-     title_area = (pad_x, pill_box[3] + gap, W - pad_x, mid + (H-mid)//2 - 12) 
-     summary_area = (pad_x, mid + (H-mid)//2 + 12, W - pad_x, H - BORDER_PX - 24) 
-     yellow, bold = pick_emphasis_tokens(title, max_yellow=2, max_bold=3) 
-     draw_words_emphasized_center( 
-         base, title_area, title, 
-         font_regular_path=FONT_BLACK, font_bold_path=FONT_BOLD, 
-         size=TG_TITLE_SIZE, yellow_words=yellow, bold_words=bold, 
-         line_spacing=TITLE_LINE_SPACING + TG_TITLE_LINE_SPACING_EXTRA 
-     ) 
-     draw_multiline_center_with_trunc( 
-         base, summary_area, summary or "", font_path=FONT_LIGHT, size=TG_SUMMARY_SIZE, 
-         fill=BEYAZ_RGBA, max_lines=5, line_spacing=SUMMARY_LINE_SPACING + TG_SUMMARY_LINE_SPACING_EXTRA
-     ) 
-     draw_logo(base, pos=(20,20), size=LOGO_SIZE) 
-     return draw_white_border(base, BORDER_PX)
-
-def process_image_web(img_url, title, summary, category, page_url=None): 
-     out = render_web(img_url, page_url, category or "Haber", title) 
-     path = os.path.join(SAVE_DIR, f"web_{uuid.uuid4()}.jpg"); save_jpg(out, path) 
-     return path, img_url, "web" 
-
-def process_image_telegram(img_url, title, summary, category, page_url=None): 
-     out = render_telegram(img_url, page_url, category or "Haber", title, summary or "") 
-     path = os.path.join(SAVE_DIR, f"tg_{uuid.uuid4()}.jpg"); save_jpg(out, path) 
-     return path, img_url, "tg" 
-
-# ===================== Çalıştırıcı (YENİ YAPIYA UYGUN) ===================== 
-
-def run(): 
-    logger.info("🤖 AI Destekli Visual Styler robotu başlatılıyor...") 
-    
+def _choose_highlights(title: str):
+    if not HIGHLIGHT_AI or generate_text is None:
+        return _choose_highlights_heuristic(title)
     try:
-        gc = get_gspread_client()
-        ws = gc.open_by_key(SHEET_ID).worksheet(TAB_NAME)
-        cols = resolve_columns(ws)
-        all_rows = ws.get_all_values()
-    except Exception as e:
-        logger.error(f"❌ Google Sheet'e bağlanırken veya okurken kritik hata: {e}")
-        traceback.print_exc()
-        return "Sheet bağlantı hatası."
+        prompt=('Başlıktaki en önemli kelimeleri seç. Çıktı JSON: {"yellow":[],"bold":[]} \n'+(title or ""))
+        js=json.loads(generate_text(prompt).strip())
+        y=[str(x) for x in (js.get("yellow") or [])][:2]
+        b=[str(x) for x in (js.get("bold") or [])][:3]
+        if y or b: return y,b
+    except Exception:
+        pass
+    return _choose_highlights_heuristic(title)
 
-    # İşlenecekleri topla
-    rows_to_process = []
-    for i, row in enumerate(all_rows[1:], start=2):
-        try:
-            if len(row) <= cols.AC -1 : continue
-            status = row[cols.AC - 1].strip()
-            title = row[cols.H - 1].strip()
-            img_url = row[cols.K - 1].strip()
-            img_web = row[cols.L - 1].strip() if len(row) > cols.L -1 else ""
-            img_tg = row[cols.M - 1].strip() if len(row) > cols.M -1 else ""
+def _choose_summary_highlights(summary: str):
+    if not HIGHLIGHT_AI or generate_text is None:
+        words=[w.strip(",.!?:;()\"'“”") for w in (summary or "").split()]
+        scored=[]
+        for w in words:
+            score=(any(c.isdigit() for c in w))*2 + min(len(w),12)/10 + (w[:1].isupper())*0.5
+            if w.lower() in STOPWORDS_TR: score -= 2
+            scored.append((score,w))
+        scored.sort(reverse=True)
+        bold=[]
+        for _,w in scored:
+            if len(bold)>=5: break
+            if w not in bold: bold.append(w)
+        return bold
+    try:
+        js=json.loads(generate_text('Özet önemli 5 kelime: {"bold":[]} \n'+(summary or "")).strip())
+        b=[str(x) for x in (js.get("bold") or [])][:5]
+        if b: return b
+    except Exception:
+        pass
+    return []
 
-            if "robot 2 başarılı" in status.lower() and title and img_url and (not img_web or not img_tg):
-                rows_to_process.append({
-                    "row_index": i, "title": title,
-                    "summary": row[cols.I - 1].strip(),
-                    "category": row[cols.C - 1].strip(),
-                    "image_url": img_url,
-                    "page_url": row[cols.G - 1].strip()
-                })
-        except IndexError:
-            logger.warning(f"Satır {i} beklenenden daha az sütuna sahip, atlanıyor.")
-            continue
+def _wrap_by_width(text: str, font, max_w: int) -> List[str]:
+    w=[]; cur=""
+    d=ImageDraw.Draw(Image.new("RGB",(10,10)))
+    for t in (text or "").split():
+        cand=(cur+" "+t).strip()
+        if d.textbbox((0,0), cand, font=font)[2] <= max_w or not cur:
+            cur=cand
+        else:
+            w.append(cur); cur=t
+    if cur: w.append(cur)
+    return w
 
-    if not rows_to_process:
-        logger.info("İşlenecek yeni görsel bulunamadı.")
-        return "İşlenecek görsel yok."
-
-    logger.info(f"{len(rows_to_process)} adet haber için görsel işlenecek...")
+# ========== FADELER ==========
+def _bottom_fade_to_black(base: Image.Image, start_y: int, strength: int = 255, fade_h: Optional[int] = None):
+    w,h=base.size
+    start_y=max(0,min(h-1,start_y))
+    fh = (h-start_y) if fade_h is None else fade_h
+    if fh<=0: return
     
-    for row in rows_to_process:
-        idx = row["row_index"]
-        logger.info(f"--- Satır {idx}: {row['title'][:50]}... işleniyor ---")
+    grad=Image.new("L",(w,fh),0); d=ImageDraw.Draw(grad)
+    for y in range(fh):
+        t=y/max(1,fh-1)
+        alpha=int(strength*(t**1.2))
+        d.line([(0,y),(w,y)], fill=alpha)
+    overlay=Image.new("RGB",(w,fh),(0,0,0))
+    base.paste(overlay,(0,start_y),grad)
+
+# ========== PILL (NİHAİ KÖŞE DÜZELTMESİ) ==========
+def _make_mask_selective(w: int, h: int, radius: int, rounded=("tl","br")) -> Image.Image:
+    """
+    Önce tüm köşeleri yuvarlak çizer; ardından rounded içinde OLMAYAN köşeleri
+    kare ile doldurup keskinleştirir. Sağ-alt köşe pürüzlerini engeller.
+    """
+    mask = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    # Taban: tüm köşeler yuvarlak
+    d.rounded_rectangle((0, 0, w-1, h-1), radius=radius, fill=255)
+    rset = set(s.lower() for s in rounded)
+    if "tl" not in rset: d.rectangle((0, 0, radius, radius), fill=255)
+    if "tr" not in rset: d.rectangle((w - radius, 0, w, radius), fill=255)
+    if "bl" not in rset: d.rectangle((0, h - radius, radius, h), fill=255)
+    if "br" not in rset: d.rectangle((w - radius, h - radius, w, h), fill=255)
+    return mask
+
+def _make_pill(text: str, font, pad_x: int, pad_y: int) -> Image.Image:
+    """
+    Kategori bandı: sol-üst ve sağ-alt yuvarlak; diğer iki köşe keskin.
+    Padding: pad_x=10, pad_y=13 (çağıran taraflarda bu değerlerle kullanılıyor).
+    """
+    txt=text
+    tmp=Image.new("RGBA",(10,10),(0,0,0,0))
+    tbb=ImageDraw.Draw(tmp).textbbox((0,0), txt, font=font)
+    pill_w=(tbb[2]-tbb[0]) + 2*pad_x
+    pill_h=(tbb[3]-tbb[1]) + 2*pad_y
+
+    # Köşe yarıçapı: istenen küçük yuvarlak
+    radius = min(PILL_CORNER_RADIUS, max(1, min(pill_w, pill_h)//2 - 1))
+
+    # Maske: yalnızca ("tl","br") yuvarlak
+    mask = _make_mask_selective(pill_w, pill_h, radius, rounded=("tl","br"))
+
+    # Gradyan
+    grad=Image.new("RGBA",(pill_w,pill_h))
+    gd=ImageDraw.Draw(grad)
+    for x in range(pill_w):
+        t = x/max(1,pill_w-1)
+        # soldan sağa #FFCC00 → #F7B500
+        r = int(255 + (247-255)*t)
+        g = int(204 + (181-204)*t)
+        b = int(  0 + (  0-  0)*t)
+        gd.line([(x,0),(x,pill_h)], fill=(r,g,b,255))
+        
+    pill=Image.new("RGBA",(pill_w,pill_h),(0,0,0,0))
+    pill.paste(grad,(0,0),mask)
+
+    # Metin
+    pd=ImageDraw.Draw(pill)
+    text_x = pad_x
+    text_y = (pill_h - (tbb[3] - tbb[1])) / 2 - tbb[1]
+    pd.text((text_x, text_y), txt, font=font, fill=(0,0,0))
+    return pill
+
+# ========== SOSYAL (X/Bluesky/LinkedIn) ==========
+def _overlay_social(im: Image.Image, title: str, category: str) -> Image.Image:
+    face=_detect_face_box(im)
+    base=_cover_focus(im, SIZE_SOC, face, bias_up=0.05)
+    W,H=base.size
+
+    max_w=int(W*0.88)
+    title_lines=None; title_fs=None; title_h=0
+    for fs in (88,82,76,70,64,58,52,46):
+        f=_font(FONT_BLACK_PATH, fs)
+        lines=_wrap_by_width(title or "", f, max_w)
+        if len(lines)<=2:
+            title_lines=lines; title_fs=fs
+            title_h=len(lines)*int(fs*1.2)
+            break
+    if title_lines is None:
+        title_fs=46
+        f=_font(FONT_BLACK_PATH, title_fs)
+        title_lines=_wrap_by_width(title or "", f, max_w)[:2]
+        title_h=len(title_lines)*int(title_fs*1.2)
+
+    f_cat=_font(FONT_BLACK_PATH, 46)
+    pill=_make_pill(_fix_category_text(category or "GÜNDEM"),
+                    f_cat, pad_x=10, pad_y=13)  # ← padding güncellendi
+
+    pad_bottom = 50
+    gap_pill_title = 20
+    
+    title_y = H - pad_bottom - title_h
+    pill_y  = title_y - gap_pill_title - pill.size[1]
+    pill_x  = (W - pill.size[0])//2
+    
+    # Transparanlık güçlendirildi: Başlangıç noktası yukarı çekildi
+    _bottom_fade_to_black(base, pill_y - 60, strength=450)
+    
+    base.paste(pill,(pill_x,pill_y), pill)
+
+    yellow,bold=_choose_highlights(title or "")
+    f_reg =_font(FONT_REG_PATH, title_fs)
+    f_black=_font(FONT_BLACK_PATH, title_fs)
+
+    overlay=Image.new("RGBA",(W,title_h),(0,0,0,0))
+    dd=ImageDraw.Draw(overlay); y=0
+    for ln in title_lines:
+        segs=[]; toks=ln.split()
+        for i,tok_raw in enumerate(toks):
+            tok = tok_raw.strip(",.!?:;'\"“”")
+            ff, col = f_reg, (255,255,255,255)
+            
+            if any(yw.strip(",.!?:;'\"“”") == tok for yw in yellow):
+                ff, col = f_black, (249,200,38,255)
+            elif any(bw.strip(",.!?:;'\"“”") == tok for bw in bold):
+                ff, col = f_black, (255,255,255,255)
+
+            txt = (" " if i>0 else "") + tok_raw
+            word_width = dd.textbbox((0,0), txt, font=ff)[2]
+            segs.append((txt, ff, col, word_width))
+        
+        lw=sum(s[3] for s in segs)
+        x=W//2 - lw//2
+        
+        for t,ff,cc,wpx in segs:
+            dd.text((x,y),t,font=ff,fill=cc)
+            x += wpx
+            
+        y += int(title_fs*1.2)
+
+    base.paste(overlay,(0,title_y), overlay)
+    _paste_logo(base)
+    _draw_white_frame(base, FRAME_PX_SOC)
+    return base
+
+# ========== TELEGRAM ==========
+def _overlay_tg(im: Image.Image, title: str, summary: str, category: str) -> Image.Image:
+    W,H=SIZE_TG
+    usable_h = H - 2*FRAME_PX_TG
+    half = usable_h // 2
+    img_paste_y = FRAME_PX_TG
+    black_area_start_y = img_paste_y + half
+    
+    face=_detect_face_box(im)
+    
+    base=Image.new("RGB",(W,H),(0,0,0))
+    
+    top_img=_cover_focus(im,(W,half), face, bias_up=0.08)
+    
+    base.paste(top_img,(FRAME_PX_TG, img_paste_y))
+    
+    _bottom_fade_to_black(base, start_y=black_area_start_y-120, strength=255, fade_h=120)
+
+    f_cat=_font(FONT_BLACK_PATH, 44)
+    pill=_make_pill(_fix_category_text(category or "GÜNDEM"),
+                    f_cat, pad_x=10, pad_y=13)  # ← padding güncellendi
+    pill_x=(W - pill.size[0])//2
+    pill_y = black_area_start_y - pill.size[1]//2
+    base.paste(pill,(pill_x,pill_y), pill)
+    
+    gap_pill_title = 40
+    title_area_top = pill_y + pill.size[1] + gap_pill_title
+    
+    summary_area_top = int(title_area_top + (H - title_area_top) * 0.45)
+    title_area_bottom = summary_area_top - 20
+    
+    allowed_h = max(60, title_area_bottom - title_area_top)
+    max_w = int(W*0.90)
+
+    yellow,bold=_choose_highlights(title or "")
+    overlay=None; used_h=None;
+    for fs in (86,80,74,68,62,56,50,46):
+        f_reg = _font(FONT_REG_PATH, fs)
+        f_black = _font(FONT_BLACK_PATH, fs)
+        lines=_wrap_by_width((title or "").strip(), f_black, max_w)
+        if len(lines)>3: continue
+        
+        line_h=int(fs*1.15)
+        current_used_h = line_h*len(lines)
+        if current_used_h > allowed_h: continue
+
+        used_h = current_used_h
+        ov=Image.new("RGBA",(W,used_h),(0,0,0,0))
+        dd=ImageDraw.Draw(ov); y_cursor=0
+        for ln in lines:
+            segs=[]; toks=ln.split()
+            for i,tok_raw in enumerate(toks):
+                tok = tok_raw.strip(",.!?:;'\"“”")
+                ff, col = f_reg, (255,255,255,255)
+
+                if any(yw.strip(",.!?:;'\"“”") == tok for yw in yellow):
+                    ff, col = f_black, (249,200,38,255)
+                elif any(bw.strip(",.!?:;'\"“”") == tok for bw in bold):
+                    ff, col = f_black, (255,255,255,255)
+
+                txt = (" " if i>0 else "")+tok_raw
+                word_width = dd.textbbox((0,0),txt,font=ff)[2]
+                segs.append((txt,ff,col,word_width))
+
+            lw=sum(s[3] for s in segs); x=W//2 - lw//2
+            for t,ff,cc,wpx in segs:
+                dd.text((x,y_cursor),t,font=ff,fill=cc); x+=wpx
+            y_cursor+=line_h
+        overlay=ov; break
+        
+    if overlay:
+        paste_y = title_area_top + (allowed_h - used_h) // 2
+        base.paste(overlay,(0, paste_y), overlay)
+
+    f_sum   = _font(FONT_REG_PATH, 33)
+    f_sbold = _font(FONT_BOLD_PATH, 33)
+    bold_sum= _choose_summary_highlights(summary or "")
+    max_w_s = int(W*0.92)
+    lh      = int(33*1.35)
+
+    meas = ImageDraw.Draw(Image.new("RGB",(10,10)))
+    lines=[]; cur=""
+    for w_ in (summary or "").split():
+        cand=(cur+" "+w_).strip()
+        if meas.textbbox((0,0), cand, font=f_sum)[2] <= max_w_s or not cur:
+            cur=cand
+        else:
+            lines.append(cur); cur=w_
+    if cur: lines.append(cur)
+    trunc = len(lines) > 5
+    lines = lines[:5]
+
+    dd = ImageDraw.Draw(base)
+    summary_total_h = len(lines) * lh
+    summary_allowed_h = (H - FRAME_PX_TG) - summary_area_top
+    y_start = summary_area_top + (summary_allowed_h - summary_total_h) // 2
+    y = y_start
+    
+    for i, ln in enumerate(lines):
+        if i == len(lines)-1 and trunc:
+            ell = " …"
+            while meas.textbbox((0,0), ln+ell, font=f_sum)[2] > max_w_s and len(ln) > 3:
+                ln = ln[:-2]
+            ln = ln + ell
+
+        segs=[]; toks=ln.split()
+        for j,tok_raw in enumerate(toks):
+            tok = tok_raw.strip(",.!?:;")
+            ff = f_sbold if any(b.strip(",.!?:;") == tok for b in bold_sum) else f_sum
+            txt=(" " if j>0 else "")+tok_raw
+            segs.append((txt,ff,meas.textbbox((0,0),txt,font=ff)[2]))
+            
+        lw=sum(s[2] for s in segs); x=W//2 - lw//2
+        for t,ff,wpx in segs:
+            dd.text((x,y), t, font=ff, fill=(230,230,230))
+            x+=wpx
+        y += lh
+
+    _paste_logo(base)
+    _draw_white_frame(base, FRAME_PX_TG)
+    return base
+
+# ========== GCS ==========
+def _img_bytes(im: Image.Image, q=92) -> bytes:
+    buf=io.BytesIO(); im.save(buf, format="JPEG", quality=q); return buf.getvalue()
+
+def _upload_gcs(b: bytes, object_path: str) -> str:
+    if not GOOGLE_STORAGE_BUCKET:
+        raise RuntimeError("GOOGLE_STORAGE_BUCKET boş.")
+    client=storage.Client(); bucket=client.bucket(GOOGLE_STORAGE_BUCKET)
+    blob=bucket.blob(object_path)
+    blob.cache_control="public, max-age=31536000"
+    blob.upload_from_string(b, content_type="image/jpeg")
+    if STORAGE_PUBLIC:
         try:
-            # Web görseli oluştur, yerel diske kaydet
-            path_web, _, _ = process_image_web(row["image_url"], row["title"], row["summary"], row["category"], page_url=row["page_url"])
-            
-            # Cloud Storage'a yükle ve linki al
-            web_gcs_url = upload_to_gcs(path_web, "web-images")
-            ws.update_cell(idx, cols.L, web_gcs_url)
-            logger.info(f"  ✓ Web görseli yüklendi: {web_gcs_url}")
+            blob.make_public()
+            return f"https://storage.googleapis.com/{GOOGLE_STORAGE_BUCKET}/{blob.name}"
+        except Exception:
+            pass
+    return blob.generate_signed_url(
+        expiration=datetime.timedelta(hours=SIGN_URL_TTL_HOURS),
+        method="GET", version="v4"
+    )
 
-            # Telegram görseli oluştur, yerel diske kaydet
-            path_tg, _, _ = process_image_telegram(row["image_url"], row["title"], row["summary"], row["category"], page_url=row["page_url"])
-            
-            # Cloud Storage'a yükle ve linki al
-            tg_gcs_url = upload_to_gcs(path_tg, "telegram-images")
-            ws.update_cell(idx, cols.M, tg_gcs_url)
-            logger.info(f"  ✓ Telegram görseli yüklendi: {tg_gcs_url}")
+LINK_STYLE = os.environ.get("LINK_STYLE", "raw").lower()
+# raw  → düz URL; formula → =HYPERLINK("url","etiket") (görsel ve tıklanabilir)
 
-            # Durumu güncelle
-            current_status = ws.cell(idx, cols.AC).value
-            ws.update_cell(idx, cols.AC, f"{current_status} / Robot 3 Başarılı (AI)")
+def _mk_link_cell(urls, label_prefix="web"):
+    if not urls:
+        return ""
+    if LINK_STYLE == "formula":
+        # Etiketli ve kısa görünen linkler
+        items = [f'=HYPERLINK("{u}","{label_prefix}_{i:03d}")' for i, u in enumerate(urls, 1)]
+    else:
+        # Düz URL
+        items = urls
+    # Virgül değil, satır sonu kullan → otomatik linkleme hatası yaşamazsın
+    return "\n".join(items)
+
+# ========== SHEET YAZMA ==========
+def _flush(ws, triples):
+    if not triples: return
+    payload_raw, payload_user = [], []
+    for (r, c, v) in triples:
+        a1 = gspread.utils.rowcol_to_a1(r, c)
+        if isinstance(v, str) and v.startswith("="):
+            payload_user.append({"range": a1, "values": [[v]]})
+        else:
+            payload_raw.append({"range": a1, "values": [[v]]})
+
+    for i in range(0, len(payload_raw), 400):
+        ws.batch_update(payload_raw[i:i+400], value_input_option="RAW")
+        time.sleep(BATCH_SLEEP_MS/1000.0)
+    for i in range(0, len(payload_user), 400):
+        ws.batch_update(payload_user[i:i+400], value_input_option="USER_ENTERED")
+        time.sleep(BATCH_SLEEP_MS/1000.0)
+
+
+# ========== ANA AKIŞ ==========
+def run():
+    sheet_id=os.environ.get("GOOGLE_SHEET_ID")
+    if not sheet_id: raise RuntimeError("GOOGLE_SHEET_ID boş.")
+    gc=get_gspread_client()
+    ws=gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
+    cols=resolve_columns(ws)
+
+    values=ws.get_all_values()
+    if not values:
+        print("Sheet boş."); return
+    data=values[1:]; base_idx=2
+
+    def r12ok(ac:str)->bool:
+        s=(ac or "").lower()
+        return ("robot 1 ✅" in s) and ("robot 2 ✅" in s)
+
+    targets=[]
+    for i,row in enumerate(data, start=base_idx):
+        ac=row[cols.AC-1] if len(row)>=cols.AC else ""
+        if not r12ok(ac): continue
+        if "robot 3 ✅" in (ac or "").lower(): continue
+        targets.append((i,row))
+    if not targets:
+        print("VisualStyler: işlenecek satır yok."); return
+    print(f"VisualStyler: hedef {len(targets)} satır.")
+
+    updates_lock=threading.Lock()
+    updates=[]; notes=[]
+    def stage(r,c,v):
+        with updates_lock: updates.append((r,c,v))
+    def note(r,msg):
+        with updates_lock: notes.append((r, cols.AD, msg))
+
+    def process_row(ridx:int, row: List[str]):
+        try:
+            title   = row[cols.H-1] if len(row)>=cols.H else ""
+            summary = row[cols.I-1] if len(row)>=cols.I else ""
+            cat     = row[cols.C-1] if len(row)>=cols.C else "GENEL"
+            row_id  = row[cols.A-1] if len(row)>=cols.A and row[cols.A-1].strip() else uuid.uuid4().hex
+            today   = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
+            root    = f"{GCS_BASE_PATH}/{today}/{row_id}-{_slug(title)[:60]}"
+
+            imgs, img_notes = pick_images(row, cols)
+            if not imgs:
+                prev=row[cols.AC-1] if len(row)>=cols.AC else ""
+                stage(ridx, cols.AC, _compose_status_block(prev, 3, False))
+                note(ridx, "Robot 3: uygun ana görsel bulunamadı")
+                return
+
+            web_urls=[]
+            for i,im in enumerate(imgs, start=1):
+                clean = im if _check_text_on_image(im) else _vision_clean(im)
+                url=_upload_gcs(_img_bytes(clean, q=92), f"{root}/web/web_{i:03d}.jpg")
+                web_urls.append(url)
+            main_web=web_urls[0]
+
+            tg=_overlay_tg(imgs[0], title, summary, cat)
+            tg_url=_upload_gcs(_img_bytes(tg, q=92), f"{root}/telegram/tg_1080x1350.jpg")
+
+            soc=_overlay_social(imgs[0], title, cat)
+            soc_url=_upload_gcs(_img_bytes(soc, q=92), f"{root}/social/social_1200x675.jpg")
+
+            stage(ridx, cols.L, _mk_link_cell(web_urls, "web"))
+            stage(ridx, cols.U, _mk_link_cell(web_urls, "web"))
+            stage(ridx, cols.M, tg_url)
+            stage(ridx, cols.Q, tg_url)
+            stage(ridx, cols.N, soc_url)
+            stage(ridx, cols.O, soc_url)
+            stage(ridx, cols.P, soc_url)
+            stage(ridx, cols.R, main_web)
+            stage(ridx, cols.S, main_web)
+            stage(ridx, cols.T, main_web)
+
+            if img_notes:
+                note(ridx, "Robot 3 not: " + " | ".join(img_notes))
+
+            prev=row[cols.AC-1] if len(row)>=cols.AC else ""
+            stage(ridx, cols.AC, _compose_status_block(prev, 3, True))
 
         except Exception as e:
-            logger.error(f"  ✗ Hata (Satır {idx}): {e}")
-            traceback.print_exc()
-            current_status = ws.cell(idx, cols.AC).value
-            ws.update_cell(idx, cols.AC, f"{current_status} / Robot 3 Hata")
-            ws.update_cell(idx, cols.AD, str(e))
-            continue
-    
-    logger.info(f"\n✅ AI Destekli VisualStyler işlemi tamamlandı!")
-    return f"İşlem tamamlandı. {len(rows_to_process)} görsel işlendi."
+            import traceback
+            print(traceback.format_exc())
+            prev=row[cols.AC-1] if len(row)>=cols.AC else ""
+            stage(ridx, cols.AC, _compose_status_block(prev, 3, False))
+            note(ridx, f"Robot 3 hata: {str(e)[:200]}")
 
-if __name__ == "__main__":
+    with ThreadPoolExecutor(max_workers=CRAFTER_CONCURRENCY) as ex:
+        futs=[ex.submit(process_row, r, row) for (r,row) in targets]
+        for _ in as_completed(futs): pass
+
+    _flush(ws, updates)
+    _flush(ws, notes)
+    print(f"VisualStyler bitti: {len(targets)} satır işlendi.")
+
+if __name__=="__main__":
     run()

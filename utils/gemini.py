@@ -1,189 +1,137 @@
 # utils/gemini.py
 # -*- coding: utf-8 -*-
-
-from __future__ import annotations
-import os, re, json, time, logging
-from typing import Dict, Any, Optional, List
+import os, time, random
+from typing import Optional, Any, List
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import google.generativeai as genai
 
-# -------- ENV --------
-API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
-FALLBACK  = os.environ.get("GEMINI_FALLBACK_MODEL", "")   # ör: "gemini-1.5-flash"
-EMB_MODEL = os.environ.get("GEMINI_EMB_MODEL", "models/embedding-001")
+# ===== Env =====
+GEMINI_API_KEY         = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL           = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_FALLBACK_MODEL  = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-1.5-flash")
+GEMINI_EMB_MODEL       = os.getenv("GEMINI_EMB_MODEL", "models/text-embedding-004")
 
-MAX_RETRY = int(os.environ.get("GEMINI_MAX_RETRY", "3"))
-SLEEP_S   = float(os.environ.get("GEMINI_RETRY_SLEEP_S", "1.0"))
-INPUT_MAX = int(os.environ.get("INPUT_MAX_CHARS", "12000"))
+GEMINI_MAX_RETRY       = int(os.getenv("GEMINI_MAX_RETRY", "3"))
+GEMINI_MIN_DELAY_S     = float(os.getenv("GEMINI_MIN_DELAY_S", "0.8"))
+GEMINI_MAX_DELAY_S     = float(os.getenv("GEMINI_MAX_DELAY_S", "4.0"))
 
-genai.configure(api_key=API_KEY)
-if not API_KEY:
-    logging.warning("GEMINI_API_KEY boş; çağrılar başarısız olabilir.")
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+INPUT_MAX_CHARS        = int(os.getenv("INPUT_MAX_CHARS", "12000"))
 
-GEN_CFG = {"temperature": 0.7, "top_p": 0.95, "top_k": 40, "max_output_tokens": 1024}
+# Güvenlik: 1 ise engel eşiğini kapatır (haber özeti gibi zararsız işler için OK)
+GEMINI_SAFETY_OFF      = os.getenv("GEMINI_SAFETY_OFF", "1") in ("1","true","True")
 
-# -------- Helpers --------
-def _truncate(s: Optional[str], limit: int = INPUT_MAX) -> str:
-    s = (s or "").strip()
-    if len(s) <= limit: return s
-    cut = s[:limit]
-    p = cut.rfind(". ")
-    return cut[:p+1] if p > 300 else cut
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY boş. .env'yi kontrol et.")
 
-def _retry(fn):
-    last = None
-    for _ in range(MAX_RETRY):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(SLEEP_S)
-    if last: raise last
+genai.configure(api_key=GEMINI_API_KEY)
 
-def _read_text(resp) -> str:
-    """resp.text'e asla dokunma; sadece candidates -> parts -> text oku."""
+SAFETY_SETTINGS = None
+if GEMINI_SAFETY_OFF:
+    # Tüm kategorilerde engellemeyi kapat
+    SAFETY_SETTINGS = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUAL", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS", "threshold": "BLOCK_NONE"},
+    ]
+
+def _truncate(s: str) -> str:
+    if not s:
+        return ""
+    if len(s) > INPUT_MAX_CHARS:
+        return s[:INPUT_MAX_CHARS] + "\n\n[trimmed]"
+    return s
+
+def _extract_text(resp: Any) -> str:
+    """
+    google-generativeai yanıtından güvenli metin çıkarımı.
+    resp.text yoksa candidates->parts üzerinden dener; yoksa "" döner.
+    """
+    if resp is None:
+        return ""
+    # Çoğu durumda
     try:
-        cands = getattr(resp, "candidates", []) or []
-        for cand in cands:
-            content = getattr(cand, "content", None)
-            parts = getattr(content, "parts", []) if content else []
-            for p in parts:
-                t = getattr(p, "text", None)
-                if isinstance(t, str) and t.strip():
-                    return t.strip()
+        t = getattr(resp, "text", None)
+        if t:
+            return t.strip()
+    except Exception:
+        pass
+    # Adaylar üzerinden parçalar
+    try:
+        cands = getattr(resp, "candidates", None) or []
+        for c in cands:
+            # finish_reason 'SAFETY' ise pas geç, diğerini dene
+            fr = getattr(c, "finish_reason", None)
+            if isinstance(fr, str) and fr.upper() == "SAFETY":
+                continue
+            if isinstance(fr, int) and fr == 2:  # 2 ~ SAFETY
+                continue
+            parts = getattr(c, "content", None)
+            parts = getattr(parts, "parts", None) if parts else None
+            if parts:
+                buf: List[str] = []
+                for p in parts:
+                    text_part = getattr(p, "text", None)
+                    if text_part:
+                        buf.append(text_part)
+                if buf:
+                    return "\n".join(buf).strip()
     except Exception:
         pass
     return ""
 
-def _json_from(text: str) -> Dict[str, str]:
-    text = (text or "").strip()
-    # düz json
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict): return obj
-    except Exception: pass
-    # { ... } blob
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if m:
-        try: 
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict): return obj
-        except Exception: pass
-    return {"title": "", "summary": "", "long": ""}
-
-def _gen_model(name: str):
-    return genai.GenerativeModel(name)
-
-# -------- Public API --------
-def get_embedding(text: str) -> List[float]:
-    if not text: return []
-    def call():
-        return genai.embed_content(model=EMB_MODEL, content=_truncate(text, 8000))
-    try:
-        resp = _retry(call)
-        return resp.get("embedding") or resp.get("data", {}).get("embedding") or []
-    except Exception as e:
-        logging.error(f"[gemini] embedding error: {e}")
-        return []
-
-def generate_text(prompt: str) -> str:
-    """Basit metin üretimi. Gerekirse fallback modele döner."""
-    model = _gen_model(MODEL)
-
-    def call():
-        return model.generate_content(_truncate(prompt), generation_config=GEN_CFG)
-
-    try:
-        resp = _retry(call)
-        out = _read_text(resp)
-        if out:
-            return out
-        # fallback
-        if FALLBACK:
-            fb = _gen_model(FALLBACK)
-            def call_fb():
-                return fb.generate_content(_truncate(prompt), generation_config=GEN_CFG)
-            resp2 = _retry(call_fb)
-            return _read_text(resp2) or ""
-        return ""
-    except Exception as e:
-        logging.error(f"[gemini] generate_text error: {e}")
-        return ""
-
-def generate_content(
-    *,
-    original_title: str,
-    original_text: str = "",
-    original_lang: str = "en",
-    target_lang: str = "tr",
-    source_name: str = "",
-) -> Dict[str, str]:
-    """title/summary/long JSON döner. Gerekirse fallback modele döner."""
-    o_title = _truncate(original_title, 800)
-    o_text  = _truncate(original_text, 9000)
-
-    prompt = f"""
-Orijinal başlık ({original_lang}): {o_title}
-Orijinal metin ({original_lang}) (opsiyonel): {o_text}
-
-Görev:
-- ÇIKTI DİLİ: {target_lang}
-- 1) 55–85 karakter arası, tıklama tuzağı olmayan başlık.
-- 2) 2–3 cümlelik tarafsız özet.
-- 3) 4–6 paragraf uzun metin; son cümlede "Kaynak: {source_name}" yaz.
-- Özel isimleri doğru yaz; tarih/yer/rakamları koru; link/emoji/hashtag kullanma.
-
-Sadece şu JSON'ı ver:
-{{"title": "...", "summary": "...", "long": "..."}}
-""".strip()
-
-    model = _gen_model(MODEL)
-
-    def call():
-        return model.generate_content(_truncate(prompt), generation_config=GEN_CFG)
-
-    try:
-        resp = _retry(call)
-        text = _read_text(resp)
-        if not text and FALLBACK:
-            fb = _gen_model(FALLBACK)
-            def call_fb():
-                return fb.generate_content(_truncate(prompt), generation_config=GEN_CFG)
-            resp2 = _retry(call_fb)
-            text = _read_text(resp2)
-
-        obj = _json_from(text)
-
-        title   = (obj.get("title") or "").strip()
-        summary = (obj.get("summary") or "").strip()
-        longtxt = (obj.get("long") or obj.get("article") or "").strip()
-
-        # küçük temizlik
-        if title.isupper(): title = title.capitalize()
-        if len(title) > 95: title = title[:92].rstrip() + "…"
-        if len(summary) > 600: summary = summary[:597].rstrip() + "…"
-        if not longtxt: longtxt = summary
-
-        return {"title": title, "summary": summary, "long": longtxt}
-    except Exception as e:
-        logging.error(f"[gemini] generate_content error: {e}")
-        return {"title": "", "summary": "", "long": ""}
-
-# -------- Self test --------
-if __name__ == "__main__":
-    print("MODEL:", MODEL)
-    print("KEY LEN:", len(os.environ.get("GEMINI_API_KEY", "")))
-
-    t = generate_text("Kısaca tek cümlelik nötr bir selamlama üret.")
-    print("TEXT:", t if t else "<empty>")
-
-    j = generate_content(
-        original_title="OpenAI yeni bir model duyurdu",
-        original_text="OpenAI, yeni modelinin muhakeme ve güvenlikte gelişmeler sunduğunu açıkladı.",
-        original_lang="tr", target_lang="tr", source_name="Demo Kaynak"
+def _gen_once(model_name: str, prompt: str, temperature: float = 0.7) -> str:
+    model = genai.GenerativeModel(
+        model_name,
+        safety_settings=SAFETY_SETTINGS,
+        generation_config={
+            "temperature": temperature,
+            "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+        },
     )
-    print("CONTENT:", json.dumps(j, ensure_ascii=False))
+    resp = model.generate_content(_truncate(prompt))
+    return _extract_text(resp)
+
+def _gen_with_retry(model_name: str, prompt: str, temperature: float) -> str:
+    last_err = ""
+    for attempt in range(1, GEMINI_MAX_RETRY + 1):
+        try:
+            text = _gen_once(model_name, prompt, temperature=temperature)
+            if text:
+                return text
+            last_err = "empty response"
+        except Exception as e:
+            last_err = str(e)
+        # bekleme (rate-limit dostu)
+        if attempt < GEMINI_MAX_RETRY:
+            time.sleep(random.uniform(GEMINI_MIN_DELAY_S, GEMINI_MAX_DELAY_S))
+    # Başarısız
+    raise RuntimeError(last_err or "gemini empty response")
+
+def generate_text(prompt: str, model: Optional[str] = None, temperature: float = 0.7) -> str:
+    """
+    Genel üretim: önce ana model, başarısızsa fallback model.
+    Boş/engellenmiş cevaplar da tekrar dener ve fallback’e geçer.
+    """
+    use_model = model or GEMINI_MODEL
+    try:
+        return _gen_with_retry(use_model, prompt, temperature)
+    except Exception:
+        if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != use_model:
+            return _gen_with_retry(GEMINI_FALLBACK_MODEL, prompt, temperature)
+        raise
+
+def generate_embedding(text: str) -> list:
+    try:
+        resp = genai.embed_content(model=GEMINI_EMB_MODEL, content=_truncate(text))
+        # 0.7+ sürümlerde sözlük verir: {"embedding": {"values": [...]}}
+        if isinstance(resp, dict):
+            return (resp.get("embedding") or {}).get("values") or []
+        emb = getattr(resp, "embedding", None)
+        return getattr(emb, "values", []) if emb else []
+    except Exception:
+        return []
