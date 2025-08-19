@@ -75,3 +75,5 @@ google-cloud-vision>=3.7.2
 Pillow>=10.3.0
 beautifulsoup4>=4.12.3
 requests>=2.31.0
+Flask
+gunicorn

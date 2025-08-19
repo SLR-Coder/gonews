@@ -790,7 +790,7 @@ def run():
             cat     = row[cols.C-1] if len(row)>=cols.C else "GENEL"
             row_id  = row[cols.A-1] if len(row)>=cols.A and row[cols.A-1].strip() else uuid.uuid4().hex
             today   = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
-            root    = f"{GCS_BASE_PATH}/{today}/{row_id}-{_slug(title)[:60]}"
+            root    = f"{GCS_BASE_PATH}/{today}/{row_id}"
 
             imgs, img_notes = pick_images(row, cols)
             if not imgs:
