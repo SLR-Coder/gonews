@@ -1,5 +1,6 @@
+#son eklemeler
 # main.py (Flask Entegrasyonlu Yeni Versiyon)
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-git status
 
 import os, json, time, datetime, traceback
 from typing import List, Dict
