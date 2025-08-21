@@ -14,19 +14,21 @@ from flask import Flask, request, jsonify
 def _safe_import():
     mods = {}
     errors = {}
-    try:
-        from robots import visual_styler as _vs
-        mods["styler"] = _vs
-    except Exception as e:
-        errors["styler"] = str(e)
-
-    # ... Diğer tüm importlarınız ...
-    try:
-        from robots import news_crawler as _crawler
-        mods["crawler"] = _crawler
-    except Exception as e:
-        errors["crawler"] = str(e)
-
+    robot_names = ["news_crawler", "content_crafter", "visual_styler", "publisher_bot", "cleaner_bot"]
+    for name in robot_names:
+        try:
+            # Örnek: from robots import news_crawler as _crawler
+            module = __import__(f"robots.{name}", fromlist=[None])
+            # Sizin kodunuzdaki anahtar isimlendirmesine uyum sağlıyoruz
+            if name == "news_crawler": key = "crawler"
+            elif name == "content_crafter": key = "crafter"
+            elif name == "visual_styler": key = "styler"
+            elif name == "publisher_bot": key = "publisher"
+            elif name == "cleaner_bot": key = "cleaner"
+            else: key = name
+            mods[key] = module
+        except Exception as e:
+            errors[name] = str(e)
     return mods, errors
 
 MODULES, IMPORT_ERRORS = _safe_import()
@@ -45,12 +47,17 @@ def acquire_lock() -> (bool, str):
     cli = storage.Client()
     bkt = cli.bucket(LOCK_BKT)
     blob = bkt.blob(LOCK_KEY)
-    if blob.exists():
+    
+    # Blob'un varlığını kontrol etmek yerine doğrudan `time_created`'a erişmeye çalışalım
+    try:
+        blob.reload() # En güncel metadata'yı al
         age = (_now_utc() - blob.time_created).total_seconds()
         if age < LOCK_TTL:
             return False, f"busy ({int(age)}s)"
-        try: blob.delete()
-        except Exception: pass
+        blob.delete()
+    except Exception: # Örneğin 404 Not Found hatası
+        pass # Kilit yoksa veya eski ise devam et
+
     try:
         blob.upload_from_string(str(time.time()), if_generation_match=0)
         return True, "acquired"
@@ -62,7 +69,6 @@ def release_lock():
     try: storage.Client().bucket(LOCK_BKT).blob(LOCK_KEY).delete()
     except Exception: pass
 
-# ... (Diğer tüm yardımcı fonksiyonlarınız aynı kalacak: _log, _run_step, vb.) ...
 def _log(msg: str, **kw):
     print(json.dumps({"t": _now_utc().isoformat(), "msg": msg, **kw}, ensure_ascii=False))
 
@@ -81,8 +87,8 @@ def _run_step(name: str) -> Dict:
 
 def _parse_workflow(raw: str) -> List[str]:
     raw = (raw or "").strip()
-    # DİKKAT: Varsayılan iş akışını güncelledim
     if not raw:
+        # Varsayılan tam iş akışı
         return ["crawler", "crafter", "styler", "publisher"]
     return [s.strip().lower() for s in raw.split(",") if s.strip()]
 
@@ -113,7 +119,7 @@ def run_gonews_endpoint():
             data = request.get_json(force=True, silent=True) or {}
             wf_raw = (data.get("workflow")
                       or request.args.get("workflow")
-                      or os.environ.get("WORKFLOW", "")) # Varsayılanı _parse_workflow'a bıraktık
+                      or os.environ.get("WORKFLOW", ""))
             steps = _parse_workflow(wf_raw)
 
             _log("workflow", steps=steps)
