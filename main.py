@@ -1,44 +1,42 @@
+from flask import Flask, request
+import subprocess
 import os
-import time
-import logging
-from robots import news_harvester, content_crafter, visual_styler, voice_smith, publisher_bot
-from utils.google_sheet_logger import log_to_sheet
 
-# Logger ayarları
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("GoNews-Master")
+app = Flask(__name__)
 
-def run_all_robots():
+@app.route("/", methods=["GET"])
+def run_all_bots():
     try:
-        logger.info("▶️ Robot 1: NewsHarvester başlatılıyor...")
-        news_harvester.run()
-        logger.info("✅ NewsHarvester tamamlandı.")
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        robots_dir = os.path.join(base_dir, "robots")
 
-        logger.info("▶️ Robot 2: ContentCrafter başlatılıyor...")
-        content_crafter.run()
-        logger.info("✅ ContentCrafter tamamlandı.")
+        bots = [
+            "news_harvester.py",
+            "content_crafter.py",
+            "visual_styler.py",
+            "voice_smith.py",
+            "podcast_duo.py",
+            "video_forge.py",
+            "publisher_bot.py"
+        ]
 
-        logger.info("▶️ Robot 3: VisualStyler başlatılıyor...")
-        visual_styler.run()
-        logger.info("✅ VisualStyler tamamlandı.")
+        logs = []
 
-        logger.info("▶️ Robot 4: VoiceSmith başlatılıyor...")
-        voice_smith.run()
-        logger.info("✅ VoiceSmith tamamlandı.")
+        for bot in bots:
+            bot_path = os.path.join(robots_dir, bot)
+            if os.path.isfile(bot_path):
+                result = subprocess.run(["python3", bot_path], capture_output=True, text=True)
+                logs.append(f"✅ {bot} çalıştı\n{result.stdout}")
+                if result.stderr:
+                    logs.append(f"⚠️ {bot} hata verdi:\n{result.stderr}")
+            else:
+                logs.append(f"⛔ {bot} bulunamadı")
 
-        logger.info("▶️ Robot 5: PublisherBot başlatılıyor...")
-        publisher_bot.run()
-        logger.info("✅ PublisherBot tamamlandı.")
-
-        # Opsiyonel: Google Sheets'e log yaz
-        log_to_sheet(status="Success", message="Tüm robotlar başarıyla tamamlandı.")
+        return "\n\n".join(logs), 200
 
     except Exception as e:
-        error_msg = f"❌ Hata oluştu: {str(e)}"
-        logger.error(error_msg)
-        log_to_sheet(status="Error", message=error_msg)
+        return f"💥 Ana betik hata verdi: {str(e)}", 500
+
 
 if __name__ == "__main__":
-    logger.info("🚀 GoNews Automation başlıyor...")
-    run_all_robots()
-    logger.info("🏁 Otomasyon tamamlandı.")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
