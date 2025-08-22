@@ -1,35 +1,44 @@
-#son eklemeler
-# main.py (Flask Entegrasyonlu Yeni Versiyon)
-# -*- coding: utf-8 -*-git status
-
+# -*- coding: utf-8 -*-
 import os, json, time, datetime, traceback
 from typing import List, Dict
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, request, jsonify
-
-# ---- Sizin yazdığınız harika kodlar burada başlıyor ----
-
 # ---- Robots: modülleri içe aktar ----
+# Bu importlar bir şey eksikse hatayı yakalayıp temiz log yazar.
 def _safe_import():
     mods = {}
     errors = {}
-    robot_names = ["news_crawler", "content_crafter", "visual_styler", "publisher_bot", "cleaner_bot"]
-    for name in robot_names:
-        try:
-            # Örnek: from robots import news_crawler as _crawler
-            module = __import__(f"robots.{name}", fromlist=[None])
-            # Sizin kodunuzdaki anahtar isimlendirmesine uyum sağlıyoruz
-            if name == "news_crawler": key = "crawler"
-            elif name == "content_crafter": key = "crafter"
-            elif name == "visual_styler": key = "styler"
-            elif name == "publisher_bot": key = "publisher"
-            elif name == "cleaner_bot": key = "cleaner"
-            else: key = name
-            mods[key] = module
-        except Exception as e:
-            errors[name] = str(e)
+    try:
+        from robots import visual_styler as _vs
+        mods["styler"] = _vs
+    except Exception as e:
+        errors["styler"] = str(e)
+
+    try:
+        from robots import publisher_bot as _pub
+        mods["publisher"] = _pub
+    except Exception as e:
+        errors["publisher"] = str(e)
+
+    try:
+        from robots import content_crafter as _crafter
+        mods["crafter"] = _crafter
+    except Exception as e:
+        errors["crafter"] = str(e)
+
+    try:
+        from robots import cleaner_bot as _clean
+        mods["cleaner"] = _clean
+    except Exception as e:
+        errors["cleaner"] = str(e)
+
+    try:
+        from robots import news_crawler as _crawler
+        mods["crawler"] = _crawler
+    except Exception as e:
+        errors["crawler"] = str(e)
+
     return mods, errors
 
 MODULES, IMPORT_ERRORS = _safe_import()
@@ -38,27 +47,28 @@ MODULES, IMPORT_ERRORS = _safe_import()
 from google.cloud import storage
 LOCK_BKT  = os.environ.get("GOOGLE_STORAGE_BUCKET", "")
 LOCK_KEY  = os.environ.get("CRON_LOCK_KEY", "locks/gonews-cron.lock")
-LOCK_TTL  = int(os.environ.get("CRON_LOCK_TTL_SEC", "900"))
+LOCK_TTL  = int(os.environ.get("CRON_LOCK_TTL_SEC", "900"))  # 15 dk
 
 def _now_utc():
     return datetime.datetime.now(datetime.timezone.utc)
 
 def acquire_lock() -> (bool, str):
-    if not LOCK_BKT: return True, "no-bucket"
+    """GCS üzerinde optimistic create ile lock alır."""
+    if not LOCK_BKT:
+        return True, "no-bucket"
     cli = storage.Client()
     bkt = cli.bucket(LOCK_BKT)
     blob = bkt.blob(LOCK_KEY)
-    
-    # Blob'un varlığını kontrol etmek yerine doğrudan `time_created`'a erişmeye çalışalım
-    try:
-        blob.reload() # En güncel metadata'yı al
+    # varsa ve taze ise bırak
+    if blob.exists():
         age = (_now_utc() - blob.time_created).total_seconds()
         if age < LOCK_TTL:
             return False, f"busy ({int(age)}s)"
-        blob.delete()
-    except Exception: # Örneğin 404 Not Found hatası
-        pass # Kilit yoksa veya eski ise devam et
-
+        # bayat; temizleyip almayı dene
+        try:
+            blob.delete()
+        except Exception:
+            pass
     try:
         blob.upload_from_string(str(time.time()), if_generation_match=0)
         return True, "acquired"
@@ -66,14 +76,19 @@ def acquire_lock() -> (bool, str):
         return False, "busy"
 
 def release_lock():
-    if not LOCK_BKT: return
-    try: storage.Client().bucket(LOCK_BKT).blob(LOCK_KEY).delete()
-    except Exception: pass
+    if not LOCK_BKT: 
+        return
+    try:
+        storage.Client().bucket(LOCK_BKT).blob(LOCK_KEY).delete()
+    except Exception:
+        pass
 
+# ---- Yardımcılar ----
 def _log(msg: str, **kw):
     print(json.dumps({"t": _now_utc().isoformat(), "msg": msg, **kw}, ensure_ascii=False))
 
 def _run_step(name: str) -> Dict:
+    """Belirli robotu çalıştır."""
     mod = MODULES.get(name)
     if not mod:
         raise RuntimeError(f"Modül yüklenemedi: {name} (import error: {IMPORT_ERRORS.get(name)})")
@@ -81,46 +96,61 @@ def _run_step(name: str) -> Dict:
         raise RuntimeError(f"Modülde run() yok: {name}")
     t0 = time.time()
     _log(f"→ step start: {name}")
-    mod.run()
+    mod.run()         # ROBOT ÇAĞRISI
     dur = round(time.time() - t0, 2)
     _log(f"✓ step done: {name}", secs=dur)
     return {"step": name, "seconds": dur, "ok": True}
 
 def _parse_workflow(raw: str) -> List[str]:
+    """
+    Örnekler:
+      "styler,publisher"
+      "crawler,cleaner,crafter,styler,publisher"
+    """
     raw = (raw or "").strip()
     if not raw:
-        # Varsayılan tam iş akışı
-        return ["crawler", "crafter", "styler", "publisher"]
+        return ["styler", "publisher"]  # varsayılan
     return [s.strip().lower() for s in raw.split(",") if s.strip()]
 
 def _check_secret(request) -> None:
+    """İsteğin geldiği yer Cloud Scheduler ise:
+       - ya OIDC ile kimlikli gelir (önerilen)
+       - extra olarak X-Cron-Token veya ?key= ile shared secret kontrolü yapıyoruz (opsiyonel).
+    """
     want = os.environ.get("CRON_SECRET", "")
-    if not want: return
+    if not want:
+        return  # secret tanımlı değilse kontrol etme
+
     got = request.headers.get("X-Cron-Token") or request.args.get("key")
     if got != want:
         raise PermissionError("invalid-cron-secret")
 
-# ---- YENİ BÖLÜM: Flask Uygulaması ----
-app = Flask(__name__)
-
-@app.route('/')
-def run_gonews_endpoint():
+# ===================== ENTRY POINT (Cloud Functions Gen2) =====================
+def run_gonews(request):
     """
-    Bu, Cloud Scheduler tarafından çağrılacak olan web endpoint'idir.
-    Sizin yazdığınız tüm harika mantığı çalıştırır.
+    HTTP tetikleyici. GET/POST kabul eder.
+    Body JSON örneği:
+      { "workflow": "styler,publisher" }
     """
     try:
         _check_secret(request)
 
+        # Aynı anda 2 kez koşmasın
         ok, reason = acquire_lock()
         if not ok:
-            return jsonify({"ok": False, "reason": reason}), 429
+            return (json.dumps({"ok": False, "reason": reason}), 429, {"Content-Type": "application/json"})
 
         try:
-            data = request.get_json(force=True, silent=True) or {}
+            # workflow seçimi: body->query->ENV (WORKFLOW)
+            data = {}
+            if request.data:
+                try:
+                    data = request.get_json(force=True, silent=True) or {}
+                except Exception:
+                    data = {}
             wf_raw = (data.get("workflow")
                       or request.args.get("workflow")
-                      or os.environ.get("WORKFLOW", ""))
+                      or os.environ.get("WORKFLOW", "styler,publisher"))
             steps = _parse_workflow(wf_raw)
 
             _log("workflow", steps=steps)
@@ -131,21 +161,21 @@ def run_gonews_endpoint():
                     results.append(_run_step(step))
                 except Exception as e:
                     _log("step failed", step=step, err=str(e), tb=traceback.format_exc())
+                    # başarısız olan adı ve hata mesajını da dön
                     results.append({"step": step, "ok": False, "error": str(e)})
+                    # zinciri burada keselim:
                     break
 
             ok_all = all(r.get("ok") for r in results)
-            return jsonify({"ok": ok_all, "results": results}), 200 if ok_all else 500
+            return (json.dumps({"ok": ok_all, "results": results}, ensure_ascii=False),
+                    200 if ok_all else 500,
+                    {"Content-Type": "application/json"})
 
         finally:
             release_lock()
 
     except PermissionError:
-        return jsonify({"ok": False, "error": "forbidden"}), 403
+        return (json.dumps({"ok": False, "error": "forbidden"}), 403, {"Content-Type": "application/json"})
     except Exception as e:
         _log("fatal", err=str(e), tb=traceback.format_exc())
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-if __name__ == "__main__":
-    # Bu bölüm, Google Cloud'un uygulamayı başlatmak için kullanacağı yerdir.
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+        return (json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type": "application/json"})
