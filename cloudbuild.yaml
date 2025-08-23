@@ -1,18 +1,32 @@
 steps:
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  entrypoint: 'gcloud'
-  args:
-  - 'functions'
-  - 'deploy'
-  - 'hello-gonews'
-  - '--gen2'
-  - '--runtime=python312'
-  - '--region=europe-west1'
-  - '--source=.'
-  - '--entry-point=run_gonews' # Test ettiğimiz ana fonksiyonumuz
-  - '--trigger-http'
-  - '--allow-unauthenticated'
-  - '--memory=1GiB'           # YENİ SATIR: Belleği 1 GB'a çıkardık
-  - '--timeout=300s'          # YENİ SATIR: Zaman aşımını 5 dakikaya çıkardık
+  # Adım 1: Docker konteynerini oluştur.
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'europe-west1-docker.pkg.dev/gonews-468409/gonews-repo/gonews-job:latest', '.']
+
+  # Adım 2: Oluşturulan konteyner imajını Artifact Registry'e yükle.
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'europe-west1-docker.pkg.dev/gonews-468409/gonews-repo/gonews-job:latest']
+
+  # Adım 3: Konteyneri bir Cloud Run Job olarak dağıt.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'jobs'
+      - 'deploy'
+      - 'gonews-automation-job'
+      - '--region=europe-west1'
+      - '--image=europe-west1-docker.pkg.dev/gonews-468409/gonews-repo/gonews-job:latest'
+      - '--tasks=1'
+      - '--max-retries=1'
+      # --- KESİN DOĞRU HİZMET HESABI ---
+      - '--service-account=gonews-robot@gonews-468409.iam.gserviceaccount.com'
+      - '--set-env-vars=GCP_PROJECT=gonews-468409,NEWS_TAB=News,LOOKBACK_HOURS=12,REQUIRE_IMAGE=1,ARTICLE_MIN_WORDS=450'
+
+# Dağıtım tamamlandığında, oluşturulan imajı Artifact Registry'de sakla.
+images:
+  - 'europe-west1-docker.pkg.dev/gonews-468409/gonews-repo/gonews-job:latest'
+
+# Dağıtımın zaman aşımı süresini artır.
 options:
-  logging: CLOUD_LOGGING_ONLY
+  timeout: '1200s'

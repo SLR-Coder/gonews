@@ -1,9 +1,6 @@
 # robots/content_crafter.py
 # -*- coding: utf-8 -*-
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import re
 import time
@@ -17,9 +14,15 @@ import gspread
 import requests
 from bs4 import BeautifulSoup
 
+from utils.secrets import get_secret
 from utils.auth import get_gspread_client
 from utils.schema import resolve_columns
-from utils.gemini import generate_text  # retry + fallback .env'e göre
+from utils.gemini import generate_text  # retry + fallback mevcut kullanım
+
+# (Opsiyonel) Cloud Logging uyumu
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("GoNews-ContentCrafter")
 
 # ================== ENV / AYARLAR ==================
 NEWS_TAB               = os.environ.get("NEWS_TAB", "News")
@@ -213,7 +216,8 @@ def build_article_prompt(source_title: str, body_text: str, link: str, category:
 
 # ================== ANA AKIŞ ==================
 def run():
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    # GOOGLE_SHEET_ID artık Secret Manager'dan
+    sheet_id = get_secret("GOOGLE_SHEET_ID")
     if not sheet_id:
         raise RuntimeError("GOOGLE_SHEET_ID boş.")
 

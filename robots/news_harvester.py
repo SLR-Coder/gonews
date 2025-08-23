@@ -1,9 +1,6 @@
 # robots/news_harvester.py
 # -*- coding: utf-8 -*-
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import re
 import uuid
@@ -15,19 +12,25 @@ from bs4 import BeautifulSoup
 from time import mktime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urljoin
 
-from utils.auth import get_gspread_client
+from utils.secrets import get_secret        # ✅ Secret Manager entegrasyonu eklendi
+from utils.auth import get_gspread_client  # ✅ Workload Identity destekli client
 from utils.schema import resolve_columns
 from utils.feeds import FEEDS
 
-# ================== AYARLAR (ENV) ==================
-NEWS_TAB          = os.environ.get("NEWS_TAB", "News")
-LOOKBACK_HOURS    = int(os.environ.get("LOOKBACK_HOURS", "12"))   # son 12 saat
-MAX_PER_FEED      = int(os.environ.get("MAX_PER_FEED", "25"))     # feed başına max item
-REQUEST_TIMEOUT   = int(os.environ.get("REQUEST_TIMEOUT", "12"))
-REQUIRE_IMAGE     = os.environ.get("REQUIRE_IMAGE", "1") in ("1", "true", "True")
-APPEND_BATCH_SIZE = int(os.environ.get("APPEND_BATCH_SIZE", "40"))
-BATCH_SLEEP_MS    = int(os.environ.get("BATCH_SLEEP_MS", "1200"))
-USER_AGENT        = os.environ.get("USER_AGENT", "GoNewsBot/1.0 (+https://example.com)")
+# ✅ Cloud Logging entegrasyonu
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("GoNews-NewsHarvester")
+
+# ================== AYARLAR (ENV / SECRET) ==================
+NEWS_TAB          = os.getenv("NEWS_TAB", "News")
+LOOKBACK_HOURS    = int(os.getenv("LOOKBACK_HOURS", "12"))   # son 12 saat
+MAX_PER_FEED      = int(os.getenv("MAX_PER_FEED", "25"))     # feed başına max item
+REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "12"))
+REQUIRE_IMAGE     = os.getenv("REQUIRE_IMAGE", "1") in ("1", "true", "True")
+APPEND_BATCH_SIZE = int(os.getenv("APPEND_BATCH_SIZE", "40"))
+BATCH_SLEEP_MS    = int(os.getenv("BATCH_SLEEP_MS", "1200"))
+USER_AGENT        = os.getenv("USER_AGENT", "GoNewsBot/1.0 (+https://example.com)")
 
 HEADERS = {"User-Agent": USER_AGENT}
 
@@ -68,7 +71,7 @@ def _normalize_lang(code):
     if not s:
         return ""
     s = s.replace("_", "-")
-    return s.split("-")[0].lower()  # en-US -> en
+    return s.split("-")[0].lower()
 
 
 def _extract_lang_from_html(soup):
@@ -108,7 +111,7 @@ def _extract_image_from_html(page_url, html):
         if im.get("srcset"):
             cand = _best_from_srcset(im["srcset"])
             if cand:
-                cand_w = 9999  # srcset'te en büyük seçildi varsay
+                cand_w = 9999
                 if cand_w > best_w:
                     best = cand
                     best_w = cand_w
@@ -192,19 +195,18 @@ def append_status_to_cell(ws, row_idx, col_idx, text):
 
 # ================== ANA ÇEKİM ==================
 def run():
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    # ✅ GOOGLE_SHEET_ID artık Secret Manager'dan alınıyor
+    sheet_id = get_secret("GOOGLE_SHEET_ID")
     if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID boş.")
+        raise RuntimeError("GOOGLE_SHEET_ID Secret Manager'da tanımlı değil!")
 
     gc = get_gspread_client()
     ws = gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
     cols = resolve_columns(ws)
 
-    # Performans: sadece link sütunu (G) çek
     try:
         existing_links = set(x.strip() for x in ws.col_values(cols.G)[2:] if x.strip())
     except Exception:
-        # fallback: tüm tabloyu al
         values = ws.get_all_values()
         existing_links = set()
         for i, row in enumerate(values, start=1):
@@ -213,29 +215,25 @@ def run():
             if len(row) >= cols.G and row[cols.G - 1]:
                 existing_links.add(row[cols.G - 1].strip())
 
-    # kanonikleştir
     existing_links = set(_canonicalize(u) for u in existing_links)
 
-    # tablo uzunluğu (bitişte AD yazımı için)
     used_rows_before = len(ws.get_all_values())
-
     now_ts = int(time.time())
     lookback_cut = now_ts - LOOKBACK_HOURS * 3600
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if not FEEDS or sum(len(v) for v in FEEDS.values()) == 0:
-        print("FEEDS boş: utils/feeds.py dosyasını doldur.")
+        logger.warning("FEEDS boş: utils/feeds.py dosyasını doldur.")
         return
 
     def append_rows(rows):
-        """Batch append + kısa uyku (quota dostu)."""
         if not rows:
             return
         ws.append_rows(rows, value_input_option="RAW")
         time.sleep(BATCH_SLEEP_MS / 1000.0)
 
     to_add_rows = []
-    row_len = max(getattr(cols, "AC", 29), getattr(cols, "K", 11), 11)  # güvenli üst limit
+    row_len = max(getattr(cols, "AC", 29), getattr(cols, "K", 11), 11)
 
     try:
         # === Kaynakları tara ===
@@ -253,20 +251,16 @@ def run():
                             continue
                         parsed += 1
 
-                        # kanonik link
                         link = _canonicalize(link)
 
-                        # Lookback
                         if published_ts and published_ts < lookback_cut:
                             skipped_old += 1
                             continue
 
-                        # Dedupe
                         if link in existing_links:
                             skipped_dup += 1
                             continue
 
-                        # Gerekirse sayfadan dil/görsel çıkar
                         page_lang = ""
                         page_img = None
                         need_lang = not lang
@@ -281,16 +275,13 @@ def run():
                                 if need_img:
                                     page_img = _extract_image_from_html(link, html)
 
-                        # Dil & görsel
                         lang_norm = _normalize_lang(lang) or page_lang or ""
                         image_url = img or page_img or ""
 
-                        # Görsel zorunlu ise ve yoksa atla
                         if REQUIRE_IMAGE and not image_url:
                             skipped_noimg += 1
                             continue
 
-                        # Satır hazırla
                         r = [""] * row_len
                         r[cols.A  - 1] = str(uuid.uuid4())
                         r[cols.B  - 1] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -300,50 +291,44 @@ def run():
                         r[cols.F  - 1] = title
                         r[cols.G  - 1] = link
                         r[cols.K  - 1] = image_url
-                        r[cols.AC - 1] = status_text(1, True)  # Durum: Robot 1 ✅
+                        r[cols.AC - 1] = status_text(1, True)
 
                         to_add_rows.append(r)
                         existing_links.add(link)
                         added += 1
 
-                    print(f"[{category} / {source_name}] parsed={parsed}, added={added}, dup={skipped_dup}, old={skipped_old}, noimg={skipped_noimg}")
+                    logger.info(f"[{category} / {source_name}] parsed={parsed}, added={added}, dup={skipped_dup}, old={skipped_old}, noimg={skipped_noimg}")
 
                 except Exception as ex:
-                    # Tek feed hatası akışı durdurmasın
-                    print("Feed hata:", category, source_name, ex)
+                    logger.error(f"Feed hata: {category} - {source_name} → {ex}")
 
-        # === Yazımlar ===
         if not to_add_rows:
-            # Haber yoksa bilgi satırı yaz ve çık
             no_news = [""] * row_len
             no_news[cols.A  - 1] = f"ℹ️ Yeni haber bulunmadı: {now_str}"
             no_news[cols.AC - 1] = f"{status_text(1, True)} — No-News"
             append_rows([no_news])
-            print("Yeni haber yok.")
+            logger.info("Yeni haber yok.")
             return
 
-        # Ayırıcı
         sep = [""] * row_len
         sep[cols.A  - 1] = f"🆕 Yeni haber çekimi: {now_str}"
         sep[cols.AC - 1] = "Separator"
         append_rows([sep])
 
-        # Haberler (batch)
         for i in range(0, len(to_add_rows), APPEND_BATCH_SIZE):
             append_rows(to_add_rows[i:i + APPEND_BATCH_SIZE])
 
-        # Not (AD) — sep dahil satır hesabı
-        last_row_index = used_rows_before + 1 + len(to_add_rows)  # +1: sep
+        last_row_index = used_rows_before + 1 + len(to_add_rows)
         ws.update_cell(last_row_index, cols.AD, f"{len(to_add_rows)} haber eklendi")
 
-        print(f"✓ {len(to_add_rows)} yeni haber eklendi.")
+        logger.info(f"✓ {len(to_add_rows)} yeni haber eklendi.")
 
     except Exception as e:
-        # Genel hata: tabloya ❌ düş
         err = [""] * row_len
         err[cols.A  - 1] = f"❗ Harvester hata: {now_str}"
         err[cols.AC - 1] = f"{status_text(1, False)} — {str(e)[:180]}"
         ws.append_rows([err], value_input_option="RAW")
+        logger.error(f"❌ Kritik hata → {e}")
         raise
 
 

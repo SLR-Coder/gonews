@@ -73,7 +73,21 @@ python-dotenv>=1.0.1
 google-cloud-storage>=2.10.0
 google-cloud-vision>=3.7.2
 Pillow>=10.3.0
-Flask==2.3.3
 tweepy>=4.14.0
 atproto>=0.0.56
+python-dotenv>=1.0.0
+google-cloud-secret-manager>=2.20.0
+oauth2client
+functions-framework==3.5.0
+google-cloud-logging
+google-cloud-scheduler
+pandas
+flask==2.3.3
+
+
+
+
+
+
+
 

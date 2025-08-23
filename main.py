@@ -1,45 +1,29 @@
-#son deneme
-from flask import Flask, request
-import subprocess
-import os
+def main(event, context):
+    import json
+    from robots.news_harvester import run as run_news_harvester  
+    from robots.content_crafter import run as run_content_crafter
+    from robots.visual_styler import run as run_visual_styler
+    from robots.voice_smith import run as run_voice_smith
+    from robots.publisher import run as run_publisher
 
-app = Flask(__name__)
+    print("🚀 GoNews otomasyonu tetiklendi")
 
-@app.route("/", methods=["GET"])
-def run_all_bots():
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        robots_dir = os.path.join(base_dir, "robots")
+        # 1. Haberleri Çek
+        run_news_harvester()   # ✅ Artık doğru fonksiyonu çağırıyor
 
-        bots = [
-            "news_harvester.py",
-            "content_crafter.py",
-            "visual_styler.py",
-            "voice_smith.py",
-            "podcast_duo.py",
-            "video_forge.py",
-            "publisher_bot.py"
-        ]
+        # 2. İçeriği Üret
+        run_content_crafter()
 
-        logs = []
+        # 3. Görselleri Hazırla
+        run_visual_styler()
 
-        for bot in bots:
-            bot_path = os.path.join(robots_dir, bot)
-            if os.path.isfile(bot_path):
-                result = subprocess.run(["python3", bot_path], capture_output=True, text=True)
-                logs.append(f"✅ {bot} çalıştı\n{result.stdout}")
-                if result.stderr:
-                    logs.append(f"⚠️ {bot} hata verdi:\n{result.stderr}")
-            else:
-                logs.append(f"⛔ {bot} bulunamadı")
+        # 4. Sesleri Oluştur
+        run_voice_smith()
 
-        return "\n\n".join(logs), 200
+        # 5. Paylaşım Yap
+        run_publisher()
 
+        print("✅ GoNews otomasyonu tamamlandı")
     except Exception as e:
-        return f"💥 Ana betik hata verdi: {str(e)}", 500
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
+        print(f"❌ Hata oluştu: {e}")

@@ -1,7 +1,5 @@
 # robots/visual_styler.py
 # -*- coding: utf-8 -*-
-from dotenv import load_dotenv
-load_dotenv()
 
 import os, io, re, uuid, time, json, hashlib, datetime, unicodedata
 from typing import List, Tuple, Optional
@@ -23,6 +21,7 @@ except Exception:
 # Proje yardımcıları
 from utils.auth import get_gspread_client
 from utils.schema import resolve_columns
+from utils.secrets import get_secret  # ✅ Secret Manager
 try:
     from utils.gemini import generate_text
 except Exception:
@@ -30,7 +29,10 @@ except Exception:
 
 # ================== ENV & SABİTLER ==================
 NEWS_TAB              = os.environ.get("NEWS_TAB", "News")
-GOOGLE_STORAGE_BUCKET = os.environ.get("GOOGLE_STORAGE_BUCKET", "")
+
+# ✅ Bucket artık Secret Manager'dan
+GOOGLE_STORAGE_BUCKET = get_secret("GOOGLE_STORAGE_BUCKET")
+
 REQUEST_TIMEOUT       = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 USER_AGENT            = os.environ.get("USER_AGENT", "GoNewsBot/1.0 (+https://example.com)")
 
@@ -321,9 +323,7 @@ def _cover_focus(im: Image.Image, target_wh: Tuple[int,int], face_box=None, bias
 
 # ========== METİN/RENK ==========
 def _font(path, size):
-    # Hata gizleme kaldırıldı. Font bulunamazsa program hata verip duracak.
-    # Bu, font yolunun yanlış olduğunu anlamanızı sağlar.
-    # Lütfen "media/font/" klasörlerinin ve .ttf dosyalarının doğru yerde olduğundan emin olun.
+    # Font bulunamazsa hata versin: yanlış font path'i kolay fark edilir.
     return ImageFont.truetype(path, size)
 
 def tr_upper(s: str) -> str:
@@ -332,16 +332,12 @@ def tr_upper(s: str) -> str:
     return s.upper()
 
 def _fix_category_text(raw: str) -> str:
-    # Fazladan boşluk yok; padding gerçek değerlerden gelsin
     s = (raw or "").replace("_", " ").replace("-", " ").strip()
-
-    # ASCII’ye indir ve map’le (aksan düzeltme)
     repl = str.maketrans({
         "ç":"c","Ç":"c","ğ":"g","Ğ":"g","ı":"i","İ":"i",
         "ö":"o","Ö":"o","ş":"s","Ş":"s","ü":"u","Ü":"u",
     })
     key = re.sub(r"\s+", " ", s.translate(repl)).strip().upper()
-
     CANON = {
         "TURKIYE GUNDEMI": "TÜRKİYE GÜNDEMİ",
         "GUNDEM":          "GÜNDEM",
@@ -356,16 +352,12 @@ def _fix_category_text(raw: str) -> str:
     }
     if key in CANON:
         s = CANON[key]
-
-    # TR upper
     return s.replace("i", "İ").replace("ı", "I").upper()
 
-# ↓↓↓ BUNU EKLE (heuristic’ten ÖNCE olsun)
 STOPWORDS_TR = {
     "ve","ile","de","da","bir","the","of","in","on","and","to",
     "ya","ama","mi","mı","mu","mü"
 }
-
 
 def _choose_highlights_heuristic(text: str):
     words=[w.strip(",.!?:;()\"'“”") for w in (text or "").split()]
@@ -446,13 +438,8 @@ def _bottom_fade_to_black(base: Image.Image, start_y: int, strength: int = 255, 
 
 # ========== PILL (NİHAİ KÖŞE DÜZELTMESİ) ==========
 def _make_mask_selective(w: int, h: int, radius: int, rounded=("tl","br")) -> Image.Image:
-    """
-    Önce tüm köşeleri yuvarlak çizer; ardından rounded içinde OLMAYAN köşeleri
-    kare ile doldurup keskinleştirir. Sağ-alt köşe pürüzlerini engeller.
-    """
     mask = Image.new("L", (w, h), 0)
     d = ImageDraw.Draw(mask)
-    # Taban: tüm köşeler yuvarlak
     d.rounded_rectangle((0, 0, w-1, h-1), radius=radius, fill=255)
     rset = set(s.lower() for s in rounded)
     if "tl" not in rset: d.rectangle((0, 0, radius, radius), fill=255)
@@ -462,28 +449,18 @@ def _make_mask_selective(w: int, h: int, radius: int, rounded=("tl","br")) -> Im
     return mask
 
 def _make_pill(text: str, font, pad_x: int, pad_y: int) -> Image.Image:
-    """
-    Kategori bandı: sol-üst ve sağ-alt yuvarlak; diğer iki köşe keskin.
-    Padding: pad_x=10, pad_y=13 (çağıran taraflarda bu değerlerle kullanılıyor).
-    """
     txt=text
     tmp=Image.new("RGBA",(10,10),(0,0,0,0))
     tbb=ImageDraw.Draw(tmp).textbbox((0,0), txt, font=font)
     pill_w=(tbb[2]-tbb[0]) + 2*pad_x
     pill_h=(tbb[3]-tbb[1]) + 2*pad_y
-
-    # Köşe yarıçapı: istenen küçük yuvarlak
     radius = min(PILL_CORNER_RADIUS, max(1, min(pill_w, pill_h)//2 - 1))
-
-    # Maske: yalnızca ("tl","br") yuvarlak
     mask = _make_mask_selective(pill_w, pill_h, radius, rounded=("tl","br"))
 
-    # Gradyan
     grad=Image.new("RGBA",(pill_w,pill_h))
     gd=ImageDraw.Draw(grad)
     for x in range(pill_w):
         t = x/max(1,pill_w-1)
-        # soldan sağa #FFCC00 → #F7B500
         r = int(255 + (247-255)*t)
         g = int(204 + (181-204)*t)
         b = int(  0 + (  0-  0)*t)
@@ -492,7 +469,6 @@ def _make_pill(text: str, font, pad_x: int, pad_y: int) -> Image.Image:
     pill=Image.new("RGBA",(pill_w,pill_h),(0,0,0,0))
     pill.paste(grad,(0,0),mask)
 
-    # Metin
     pd=ImageDraw.Draw(pill)
     text_x = pad_x
     text_y = (pill_h - (tbb[3] - tbb[1])) / 2 - tbb[1]
@@ -522,7 +498,7 @@ def _overlay_social(im: Image.Image, title: str, category: str) -> Image.Image:
 
     f_cat=_font(FONT_BLACK_PATH, 46)
     pill=_make_pill(_fix_category_text(category or "GÜNDEM"),
-                    f_cat, pad_x=10, pad_y=13)  # ← padding güncellendi
+                    f_cat, pad_x=10, pad_y=13)
 
     pad_bottom = 50
     gap_pill_title = 20
@@ -531,7 +507,6 @@ def _overlay_social(im: Image.Image, title: str, category: str) -> Image.Image:
     pill_y  = title_y - gap_pill_title - pill.size[1]
     pill_x  = (W - pill.size[0])//2
     
-    # Transparanlık güçlendirildi: Başlangıç noktası yukarı çekildi
     _bottom_fade_to_black(base, pill_y - 60, strength=450)
     
     base.paste(pill,(pill_x,pill_y), pill)
@@ -547,23 +522,18 @@ def _overlay_social(im: Image.Image, title: str, category: str) -> Image.Image:
         for i,tok_raw in enumerate(toks):
             tok = tok_raw.strip(",.!?:;'\"“”")
             ff, col = f_reg, (255,255,255,255)
-            
             if any(yw.strip(",.!?:;'\"“”") == tok for yw in yellow):
                 ff, col = f_black, (249,200,38,255)
             elif any(bw.strip(",.!?:;'\"“”") == tok for bw in bold):
                 ff, col = f_black, (255,255,255,255)
-
             txt = (" " if i>0 else "") + tok_raw
             word_width = dd.textbbox((0,0), txt, font=ff)[2]
             segs.append((txt, ff, col, word_width))
-        
         lw=sum(s[3] for s in segs)
         x=W//2 - lw//2
-        
         for t,ff,cc,wpx in segs:
             dd.text((x,y),t,font=ff,fill=cc)
             x += wpx
-            
         y += int(title_fs*1.2)
 
     base.paste(overlay,(0,title_y), overlay)
@@ -591,7 +561,7 @@ def _overlay_tg(im: Image.Image, title: str, summary: str, category: str) -> Ima
 
     f_cat=_font(FONT_BLACK_PATH, 44)
     pill=_make_pill(_fix_category_text(category or "GÜNDEM"),
-                    f_cat, pad_x=10, pad_y=13)  # ← padding güncellendi
+                    f_cat, pad_x=10, pad_y=13)
     pill_x=(W - pill.size[0])//2
     pill_y = black_area_start_y - pill.size[1]//2
     base.paste(pill,(pill_x,pill_y), pill)
@@ -625,12 +595,10 @@ def _overlay_tg(im: Image.Image, title: str, summary: str, category: str) -> Ima
             for i,tok_raw in enumerate(toks):
                 tok = tok_raw.strip(",.!?:;'\"“”")
                 ff, col = f_reg, (255,255,255,255)
-
                 if any(yw.strip(",.!?:;'\"“”") == tok for yw in yellow):
                     ff, col = f_black, (249,200,38,255)
                 elif any(bw.strip(",.!?:;'\"“”") == tok for bw in bold):
                     ff, col = f_black, (255,255,255,255)
-
                 txt = (" " if i>0 else "")+tok_raw
                 word_width = dd.textbbox((0,0),txt,font=ff)[2]
                 segs.append((txt,ff,col,word_width))
@@ -716,18 +684,15 @@ def _upload_gcs(b: bytes, object_path: str) -> str:
     )
 
 LINK_STYLE = os.environ.get("LINK_STYLE", "raw").lower()
-# raw  → düz URL; formula → =HYPERLINK("url","etiket") (görsel ve tıklanabilir)
+# raw  → düz URL; formula → =HYPERLINK("url","etiket")
 
 def _mk_link_cell(urls, label_prefix="web"):
     if not urls:
         return ""
     if LINK_STYLE == "formula":
-        # Etiketli ve kısa görünen linkler
         items = [f'=HYPERLINK("{u}","{label_prefix}_{i:03d}")' for i, u in enumerate(urls, 1)]
     else:
-        # Düz URL
         items = urls
-    # Virgül değil, satır sonu kullan → otomatik linkleme hatası yaşamazsın
     return "\n".join(items)
 
 # ========== SHEET YAZMA ==========
@@ -751,7 +716,8 @@ def _flush(ws, triples):
 
 # ========== ANA AKIŞ ==========
 def run():
-    sheet_id=os.environ.get("GOOGLE_SHEET_ID")
+    # ✅ Sheet ID artık Secret Manager'dan
+    sheet_id = get_secret("GOOGLE_SHEET_ID")
     if not sheet_id: raise RuntimeError("GOOGLE_SHEET_ID boş.")
     gc=get_gspread_client()
     ws=gc.open_by_key(sheet_id).worksheet(NEWS_TAB)
