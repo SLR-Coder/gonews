@@ -1,29 +1,34 @@
-def main(event, context):
-    import json
-    from robots.news_harvester import run as run_news_harvester  
-    from robots.content_crafter import run as run_content_crafter
-    from robots.visual_styler import run as run_visual_styler
-    from robots.voice_smith import run as run_voice_smith
-    from robots.publisher import run as run_publisher
+import logging
+from flask import Flask, request
+from google.cloud import secretmanager
+from robots import news_harvester, content_crafter, visual_styler, voice_smith, publisher
 
-    print("🚀 GoNews otomasyonu tetiklendi")
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+def get_secret(secret_id):
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/<GCP_PROJECT_ID>/secrets/{secret_id}/versions/latest"
+    response = client.access_secret_version(name=name)
+    return response.payload.data.decode("UTF-8")
+
+@app.route("/", methods=["POST"])
+def main():
+    logging.info("🚀 GoNews otomasyonu tetiklendi")
 
     try:
-        # 1. Haberleri Çek
-        run_news_harvester()   # ✅ Artık doğru fonksiyonu çağırıyor
+        news_harvester.run()
+        content_crafter.run()
+        visual_styler.run()
+        voice_smith.run()
+        publisher.run()
 
-        # 2. İçeriği Üret
-        run_content_crafter()
+        logging.info("✅ GoNews otomasyonu tamamlandı")
+        return {"status": "success"}, 200
 
-        # 3. Görselleri Hazırla
-        run_visual_styler()
-
-        # 4. Sesleri Oluştur
-        run_voice_smith()
-
-        # 5. Paylaşım Yap
-        run_publisher()
-
-        print("✅ GoNews otomasyonu tamamlandı")
     except Exception as e:
-        print(f"❌ Hata oluştu: {e}")
+        logging.error(f"❌ Hata oluştu: {e}")
+        return {"status": "error", "message": str(e)}, 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
